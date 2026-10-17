@@ -69,6 +69,8 @@ impl OracleConsumer {
         env.storage()
             .instance()
             .set(&DataKey::MaxStaleness, &DEFAULT_MAX_STALENESS_SECONDS);
+        env.events()
+            .publish((symbol_short!("orcl_init"),), (admin, oracle));
     }
 
     /// Pulls the latest price for a given asset from the configured external oracle.
@@ -261,6 +263,8 @@ impl OracleConsumer {
         env.storage()
             .instance()
             .set(&DataKey::OracleAddress, &new_oracle);
+        env.events()
+            .publish((symbol_short!("orcl_set"), admin), new_oracle);
     }
 
     /// Registers a secondary fallback oracle source. Restricted to the administrator.
@@ -271,6 +275,8 @@ impl OracleConsumer {
         env.storage()
             .instance()
             .set(&DataKey::SecondaryOracleAddress, &new_oracle);
+        env.events()
+            .publish((symbol_short!("orcl2set"), admin), new_oracle);
     }
 
     /// Returns the configured secondary fallback oracle, if any.
@@ -288,6 +294,85 @@ impl OracleConsumer {
         assert!(lookback_seconds > 0, "lookback window must be positive");
         env.storage()
             .instance()
-    
+            .set(&DataKey::DefaultTwapWindow, &lookback_seconds);
+        env.events()
+            .publish((symbol_short!("twap_set"), admin), lookback_seconds);
+    }
 
-/* … truncated 4904 chars — edit only what you need near the top … */
+    pub fn set_max_price_age(env: Env, max_age_seconds: u64) {
+        let admin = Self::get_admin(&env);
+        admin.require_auth();
+        assert!(max_age_seconds > 0, "max price age must be positive");
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxPriceAge, &max_age_seconds);
+        env.events()
+            .publish((symbol_short!("age_set"), admin), max_age_seconds);
+    }
+
+    pub fn set_max_staleness(env: Env, max_staleness_seconds: u64) {
+        let admin = Self::get_admin(&env);
+        admin.require_auth();
+        assert!(max_staleness_seconds > 0, "max staleness must be positive");
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxStaleness, &max_staleness_seconds);
+        env.events()
+            .publish((symbol_short!("stale_set"), admin), max_staleness_seconds);
+    }
+
+    pub fn get_max_staleness(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxStaleness)
+            .unwrap_or(DEFAULT_MAX_STALENESS_SECONDS)
+    }
+
+    fn assert_not_stale(
+        env: &Env,
+        price_timestamp: u64,
+        max_staleness_seconds: u64,
+    ) -> Result<(), Error> {
+        if env.ledger().timestamp().saturating_sub(price_timestamp) > max_staleness_seconds {
+            return Err(Error::OraclePriceStale);
+        }
+        Ok(())
+    }
+
+    fn get_admin(env: &Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("admin not set")
+    }
+
+    fn get_price_record(env: &Env, asset: Address) -> PriceData {
+        env.storage()
+            .instance()
+            .get(&DataKey::PriceRecord(asset))
+            .expect("no price record for asset")
+    }
+
+    fn get_price_history(env: &Env, asset: Address) -> Vec<PriceData> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PriceHistory(asset))
+            .unwrap_or(Vec::new(env))
+    }
+
+    fn store_observation(env: &Env, asset: Address, price_info: PriceData) {
+        let mut history = Self::get_price_history(env, asset.clone());
+        history.push_back(price_info);
+        let max_observations: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxObservations)
+            .unwrap_or(DEFAULT_MAX_OBSERVATIONS);
+        while history.len() > max_observations {
+            history.pop_front();
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::PriceHistory(asset), &history);
+    }
+}

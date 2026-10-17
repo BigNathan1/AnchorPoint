@@ -91,6 +91,10 @@ impl YieldFarmingDistributor {
             .instance()
             .set(&DataKey::RewardRemainder, &0i128);
         env.storage().instance().set(&DataKey::VaultTotalShares, &0i128);
+        env.events().publish(
+            (symbol_short!("init"),),
+            (admin, amm_pool, reward_token, reward_rate),
+        );
     }
 
     /// Return the number of auto-compounding vault shares held by `user`.
@@ -146,9 +150,9 @@ impl YieldFarmingDistributor {
                     reward.into_val(&env)
                 ],
             );
-            env.events()
-                .publish((symbol_short!("claimed"),), (user, reward));
         }
+        env.events()
+            .publish((symbol_short!("claimed"),), (user, reward));
         reward
     }
 

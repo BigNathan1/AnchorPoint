@@ -55,6 +55,8 @@ impl UpgradeableContract {
         env.storage()
             .instance()
             .set(&soroban_sdk::symbol_short!("sec_reg"), &registry);
+        env.events()
+            .publish((soroban_sdk::symbol_short!("sec_reg"),), registry);
     }
 
     /// Initializes the contract with the given multi-sig admin list (5 addresses).
@@ -85,6 +87,10 @@ impl UpgradeableContract {
         env.storage()
             .instance()
             .set(&DataKey::StorageVersion, &1u32);
+        env.events().publish(
+            (soroban_sdk::symbol_short!("upg_init"),),
+            (admin_list, 1_u32),
+        );
     }
 
     /// Returns the current storage schema version.

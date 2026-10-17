@@ -85,6 +85,10 @@ impl XLMWrapper {
         let contract_addr = env.current_contract_address();
         env.storage().instance().set(&DataKey::AMMAuthorized(contract_addr.clone()), &true);
         env.storage().instance().set(&DataKey::LendingAuthorized(contract_addr), &true);
+        env.events().publish(
+            (symbol_short!("init"),),
+            (admin, token, name, symbol, native_asset),
+        );
     }
 
     /// Deposit native XLM to mint wXLM tokens (1:1 ratio)

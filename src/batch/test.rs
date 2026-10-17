@@ -2,8 +2,8 @@
 
 use super::{BatchExecutor, BatchExecutorClient, BatchResult, Call, CallWithRetry, OpStatus, RetryConfig, TransferOp};
 use soroban_sdk::{
-    contract, contractimpl, symbol_short, testutils::Address as _, token::StellarAssetClient,
-    Env, IntoVal, Vec,
+    contract, contractimpl, symbol_short, testutils::{Address as _, Events},
+    token::StellarAssetClient, vec as svec, Env, IntoVal, Vec,
 };
 
 #[contract]
@@ -106,6 +106,19 @@ fn test_execute_batch() {
     let v1: u32 = results.get_unchecked(1).into_val(&env);
     assert_eq!(v0, 123u32);
     assert_eq!(v1, 456u32);
+    let events = env.events().all();
+    assert_eq!(
+        events.get(events.len() - 1).unwrap(),
+        (
+            client.address.clone(),
+            svec![
+                &env,
+                symbol_short!("exec").into_val(&env),
+                symbol_short!("batch").into_val(&env),
+            ],
+            (caller, 0_u64, 2_u32).into_val(&env),
+        )
+    );
 }
 
 #[test]

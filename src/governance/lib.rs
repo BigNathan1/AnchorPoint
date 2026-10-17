@@ -149,6 +149,8 @@ impl GovernanceContract {
         env.storage()
             .instance()
             .set(&DataKey::QuorumPercentage, &DEFAULT_QUORUM_PERCENTAGE);
+        env.events()
+            .publish((symbol_short!("gov_init"),), (admin, token_contract));
     }
 
     /// Step 1 of 2-step admin transfer: current admin proposes a new admin.

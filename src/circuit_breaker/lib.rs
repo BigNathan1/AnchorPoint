@@ -162,6 +162,10 @@ impl CircuitBreaker {
         env.storage()
             .instance()
             .set(&DataKey::AuthorizedBots, &bots);
+        env.events().publish(
+            (symbol_short!("cb_init"),),
+            (admin, oracle, tl, vbps),
+        );
     }
 
     // ── Bot management ────────────────────────────────────────────────────────

@@ -1,5 +1,7 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, String, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Vec,
+};
 
 #[contracttype]
 #[derive(Clone)]
@@ -28,6 +30,10 @@ impl EscrowMultisig {
         e.storage().instance().set(&DataKey::Threshold, &threshold);
         e.storage().instance().set(&DataKey::Recipient, &recipient);
         e.storage().instance().set(&DataKey::Initialized, &true);
+        e.events().publish(
+            (symbol_short!("esc_init"),),
+            (signers, threshold, recipient),
+        );
     }
 
     /// Release funds to the recipient.
@@ -90,6 +96,10 @@ impl EscrowMultisig {
 
         if balance > 0 {
             token_client.transfer(&e.current_contract_address(), &recipient, &balance);
+            e.events().publish(
+                (symbol_short!("released"),),
+                (signers, token, recipient, balance),
+            );
         }
     }
 
@@ -119,9 +129,9 @@ impl EscrowMultisig {
 mod tests {
     use super::*;
     use soroban_sdk::{
-        testutils::Address as _,
+        testutils::{Address as _, Events},
         token::{Client as TokenClient, StellarAssetClient},
-        Address, Env, Vec,
+        vec as svec, Address, Env, IntoVal, Vec,
     };
 
     #[test]
@@ -179,6 +189,15 @@ mod tests {
         // Check balance of recipient
         assert_eq!(token_client.balance(&recipient), deposit_amount);
         assert_eq!(token_client.balance(&contract_id), 0);
+        let events = e.events().all();
+        assert_eq!(
+            events.get(events.len() - 1).unwrap(),
+            (
+                contract_id,
+                svec![&e, symbol_short!("released").into_val(&e)],
+                (m_signers, token_id.address(), recipient, deposit_amount).into_val(&e),
+            )
+        );
     }
 
     #[test]

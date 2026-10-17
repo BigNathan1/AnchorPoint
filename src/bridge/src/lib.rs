@@ -105,6 +105,10 @@ impl Bridge {
         env.storage()
             .instance()
             .set(&DataKey::EmergencyMode, &false);
+        env.events().publish(
+            (symbol_short!("br_init"),),
+            (admin, relayer_key, min_collateral_ratio),
+        );
     }
 
     /// Set the replay-protection window in ledgers (admin only).

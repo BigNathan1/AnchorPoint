@@ -76,6 +76,8 @@ impl OracleMedianizer {
         env.storage()
             .instance()
             .set(&DataKey::MinSources, &min_sources);
+        env.events()
+            .publish((symbol_short!("orcl_init"),), (admin, min_sources));
     }
 
     /// Add an authorized oracle source
@@ -195,6 +197,10 @@ impl OracleMedianizer {
         env.storage()
             .instance()
             .set(&DataKey::Heartbeat(asset.clone()), &heartbeat_seconds);
+        env.events().publish(
+            (symbol_short!("heartbeat"), asset),
+            (caller, heartbeat_seconds),
+        );
     }
 
     /// Set deviation threshold for an asset
@@ -219,6 +225,10 @@ impl OracleMedianizer {
         env.storage()
             .instance()
             .set(&DataKey::DeviationThreshold(asset.clone()), &threshold_bps);
+        env.events().publish(
+            (symbol_short!("dev_set"), asset),
+            (caller, threshold_bps),
+        );
     }
 
     /// Submit a price update from an oracle source

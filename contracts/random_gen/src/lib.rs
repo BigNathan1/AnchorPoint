@@ -52,6 +52,8 @@ impl RandomGen {
 
         let committers: Vec<Address> = Vec::new(&env);
         env.storage().instance().set(&DataKey::Committers, &committers);
+        env.events()
+            .publish((symbol_short!("rng_init"),), (admin, min_commits));
     }
 
     /// Phase 1: Users commit a hash of their secret.
