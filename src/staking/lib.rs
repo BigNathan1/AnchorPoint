@@ -3,6 +3,8 @@ use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, vec, Address, Env, Vec,
 };
 
+pub mod snapshot;
+
 #[contracttype]
 pub enum DataKey {
     Admin,
@@ -141,7 +143,6 @@ impl StakingContract {
         env.storage().instance().get(&DataKey::Tiers).unwrap()
     }
 
-<<<<<<< Updated upstream
     /// Admin-tunable dynamic APR scaling configuration.
     pub fn set_emission_params(env: Env, params: EmissionParams) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
@@ -202,14 +203,14 @@ impl StakingContract {
             .checked_mul(emission_bps)
             .expect("apr overflow")
             / (REWARD_PRECISION * BPS)
-=======
+    }
+
     pub fn set_penalty_pool(env: Env, penalty_pool: Address) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.storage()
             .instance()
             .set(&DataKey::PenaltyPool, &penalty_pool);
->>>>>>> Stashed changes
     }
 
     pub fn stake(env: Env, user: Address, amount: i128, tier_index: u32) {
@@ -306,9 +307,6 @@ impl StakingContract {
             .accumulated_rewards
             .checked_add(Self::accrued_rewards(&env, &info, current_time))
             .expect("rewards overflow");
-        let base_rate: i128 = env.storage().instance().get(&DataKey::BaseRate).unwrap();
-        let rewards =
-            info.accumulated_rewards + Self::calc_new_rewards(base_rate, &info, current_time);
         let mut amount_to_return = info.amount;
 
         if current_time < info.lock_end {
@@ -375,9 +373,6 @@ impl StakingContract {
             .accumulated_rewards
             .checked_add(Self::accrued_rewards(&env, &info, current_time))
             .expect("rewards overflow");
-        let base_rate: i128 = env.storage().instance().get(&DataKey::BaseRate).unwrap();
-        let rewards =
-            info.accumulated_rewards + Self::calc_new_rewards(base_rate, &info, current_time);
         assert!(rewards > 0, "no rewards to claim");
 
         info.accumulated_rewards = 0;
@@ -528,7 +523,6 @@ fn default_emission_params() -> EmissionParams {
         target_capacity: DEFAULT_TARGET_CAPACITY,
         min_multiplier_bps: DEFAULT_MIN_MULTIPLIER_BPS,
         max_multiplier_bps: DEFAULT_MAX_MULTIPLIER_BPS,
-        (info.amount * base_rate * seconds * info.rate_multiplier) / (REWARD_PRECISION * 100)
     }
 }
 
@@ -539,8 +533,7 @@ mod tests {
     use soroban_sdk::{
         symbol_short,
         testutils::{Address as _, Ledger},
-        token::{Client as TokenClient, StellarAssetClient},
-        token::{self, StellarAssetClient},
+        token::{self, Client as TokenClient, StellarAssetClient},
         Address, Env,
     };
 

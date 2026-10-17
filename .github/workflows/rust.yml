@@ -69,6 +69,9 @@ jobs:
       - name: Test upgradeable
         run: cargo test -p upgradeable
 
+      - name: Record staking snapshot gas benchmarks
+        run: cargo test -p soroban-gas-benchmarks benchmark_ -- --nocapture
+
       - name: Run Security Audit
         run: ./scripts/security-audit.sh --warn-only
       - name: Test
