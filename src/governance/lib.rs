@@ -67,6 +67,8 @@ pub enum ProposalStatus {
     CLOSED,
     /// Proposal has been executed
     EXECUTED,
+    /// Proposal was cancelled by its creator before voting closed
+    CANCELLED,
 }
 
 /// Proposal structure with all governance data
@@ -400,6 +402,29 @@ impl GovernanceContract {
             .publish((symbol_short!("created"), new_id), (creator, title));
 
         new_id
+    }
+
+    /// Cancel a pending proposal. Only its creator may cancel it before voting ends.
+    pub fn cancel_proposal(env: Env, creator: Address, proposal_id: u32) {
+        creator.require_auth();
+
+        let mut proposal: Proposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::Proposal(proposal_id))
+            .expect("proposal not found");
+        assert!(proposal.creator == creator, "only proposal creator can cancel");
+        assert!(proposal.status == ProposalStatus::OPEN, "proposal is not pending");
+        assert!(env.ledger().timestamp() < proposal.deadline, "voting period has ended");
+
+        proposal.status = ProposalStatus::CANCELLED;
+        env.storage()
+            .instance()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "ProposalCancelled"), proposal_id),
+            creator,
+        );
     }
 
     /// Vote on a proposal using quadratic voting
@@ -925,6 +950,78 @@ mod tests {
             &86400u64,
         );
         assert_eq!(proposal_id, 1);
+    }
+
+    #[test]
+    fn test_creator_can_cancel_pending_proposal() {
+        let (env, _, _) = setup();
+        let id = env.register(GovernanceContract, ());
+        let client = GovernanceContractClient::new(&env, &id);
+        let creator = Address::generate(&env);
+        let proposal_id = client.create_proposal(
+            &creator,
+            &String::from_str(&env, "Test Proposal"),
+            &String::from_str(&env, "A proposal for testing"),
+            &86400u64,
+        );
+
+        client.cancel_proposal(&creator, &proposal_id);
+
+        assert_eq!(client.get_proposal(&proposal_id).status, ProposalStatus::CANCELLED);
+    }
+
+    #[test]
+    #[should_panic(expected = "only proposal creator can cancel")]
+    fn test_non_creator_cannot_cancel_proposal() {
+        let (env, _, _) = setup();
+        let id = env.register(GovernanceContract, ());
+        let client = GovernanceContractClient::new(&env, &id);
+        let creator = Address::generate(&env);
+        let proposal_id = client.create_proposal(
+            &creator,
+            &String::from_str(&env, "Test Proposal"),
+            &String::from_str(&env, "A proposal for testing"),
+            &86400u64,
+        );
+
+        client.cancel_proposal(&Address::generate(&env), &proposal_id);
+    }
+
+    #[test]
+    #[should_panic(expected = "proposal is not open")]
+    fn test_cancelled_proposal_cannot_be_voted_on() {
+        let (env, _, _) = setup();
+        let id = env.register(GovernanceContract, ());
+        let client = GovernanceContractClient::new(&env, &id);
+        let creator = Address::generate(&env);
+        let voter = Address::generate(&env);
+        let proposal_id = client.create_proposal(
+            &creator,
+            &String::from_str(&env, "Test Proposal"),
+            &String::from_str(&env, "A proposal for testing"),
+            &86400u64,
+        );
+
+        client.cancel_proposal(&creator, &proposal_id);
+        client.vote(&voter, &proposal_id, &true, &1i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "proposal must be closed before execution")]
+    fn test_cancelled_proposal_cannot_be_executed() {
+        let (env, _, _) = setup();
+        let id = env.register(GovernanceContract, ());
+        let client = GovernanceContractClient::new(&env, &id);
+        let creator = Address::generate(&env);
+        let proposal_id = client.create_proposal(
+            &creator,
+            &String::from_str(&env, "Test Proposal"),
+            &String::from_str(&env, "A proposal for testing"),
+            &86400u64,
+        );
+
+        client.cancel_proposal(&creator, &proposal_id);
+        client.execute_proposal(&creator, &proposal_id);
     }
 
     #[test]

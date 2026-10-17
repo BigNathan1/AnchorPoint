@@ -3,6 +3,8 @@ use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, vec, Address, Env, Vec,
 };
 
+pub mod snapshot;
+
 #[contracttype]
 pub enum DataKey {
     Admin,
@@ -535,7 +537,6 @@ fn default_emission_params() -> EmissionParams {
         target_capacity: DEFAULT_TARGET_CAPACITY,
         min_multiplier_bps: DEFAULT_MIN_MULTIPLIER_BPS,
         max_multiplier_bps: DEFAULT_MAX_MULTIPLIER_BPS,
-        (info.amount * base_rate * seconds * info.rate_multiplier) / (REWARD_PRECISION * 100)
     }
 }
 
@@ -546,8 +547,7 @@ mod tests {
     use soroban_sdk::{
         symbol_short,
         testutils::{Address as _, Ledger},
-        token::{Client as TokenClient, StellarAssetClient},
-        token::{self, StellarAssetClient},
+        token::{self, Client as TokenClient, StellarAssetClient},
         Address, Env,
     };
 
