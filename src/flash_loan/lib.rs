@@ -77,6 +77,8 @@ impl FlashLoanProvider {
         env.storage()
             .instance()
             .set(&soroban_sdk::symbol_short!("sec_reg"), &registry);
+        env.events()
+            .publish((symbol_short!("sec_reg"),), registry);
     }
 
     /// Set the fee basis points for flash loans.
@@ -86,6 +88,8 @@ impl FlashLoanProvider {
             panic!("fee cannot exceed 100%");
         }
         env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
+        env.events()
+            .publish((symbol_short!("fee_set"),), fee_bps);
     }
 
     /// Get the current fee basis points.
@@ -95,6 +99,8 @@ impl FlashLoanProvider {
 
     pub fn set_reward_pool(env: Env, address: Address) {
         env.storage().instance().set(&DataKey::RewardPool, &address);
+        env.events()
+            .publish((symbol_short!("reward"),), address);
     }
 
     /// Acquire the reentrancy lock, trapping if a flash loan is already in progress.

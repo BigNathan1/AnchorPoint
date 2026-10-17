@@ -288,6 +288,10 @@ impl MultiAssetSwap {
             last_sqrt_price: sqrt_price_x96,
         });
         env.storage().instance().set(&DataKey::ReferralFeeRate, &100_u32); // 1% referral fee by default
+        env.events().publish(
+            (symbol_short!("pool_init"),),
+            (token_a, token_b, sqrt_price_x96, tick),
+        );
     }
 
     /// Creates a new position with concentrated liquidity.

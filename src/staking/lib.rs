@@ -81,6 +81,8 @@ impl StakingContract {
         env.storage()
             .instance()
             .set(&soroban_sdk::symbol_short!("sec_reg"), &registry);
+        env.events()
+            .publish((symbol_short!("sec_reg"),), registry);
     }
 
     pub fn initialize(
@@ -128,6 +130,8 @@ impl StakingContract {
         env.storage()
             .instance()
             .set(&DataKey::Tiers, &default_tiers);
+        env.events()
+            .publish((symbol_short!("stk_init"),), (admin, token, base_rate, penalty_bps));
     }
 
     pub fn set_tiers(env: Env, tiers: Vec<LockTier>) {
@@ -135,13 +139,14 @@ impl StakingContract {
         admin.require_auth();
         assert!(!tiers.is_empty(), "need at least one tier");
         env.storage().instance().set(&DataKey::Tiers, &tiers);
+        env.events()
+            .publish((symbol_short!("tiers"), admin), tiers);
     }
 
     pub fn get_tiers(env: Env) -> Vec<LockTier> {
         env.storage().instance().get(&DataKey::Tiers).unwrap()
     }
 
-<<<<<<< Updated upstream
     /// Admin-tunable dynamic APR scaling configuration.
     pub fn set_emission_params(env: Env, params: EmissionParams) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
@@ -161,6 +166,8 @@ impl StakingContract {
         env.storage()
             .instance()
             .set(&DataKey::EmissionParams, &params);
+        env.events()
+            .publish((symbol_short!("emit_set"), admin), params);
     }
 
     /// Falls back to the defaults so instances deployed before dynamic scaling
@@ -202,14 +209,16 @@ impl StakingContract {
             .checked_mul(emission_bps)
             .expect("apr overflow")
             / (REWARD_PRECISION * BPS)
-=======
+    }
+
     pub fn set_penalty_pool(env: Env, penalty_pool: Address) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.storage()
             .instance()
             .set(&DataKey::PenaltyPool, &penalty_pool);
->>>>>>> Stashed changes
+        env.events()
+            .publish((symbol_short!("pen_pool"), admin), penalty_pool);
     }
 
     pub fn stake(env: Env, user: Address, amount: i128, tier_index: u32) {
@@ -270,12 +279,14 @@ impl StakingContract {
             .persistent()
             .set(&DataKey::Stake(user.clone()), &info);
         env.events().publish(
-            (symbol_short!("stake"), user),
+            (symbol_short!("stake"), user.clone()),
             (
                 amount,
                 info.lock_end,
-                Self::current_emission_multiplier_bps(env),
+                Self::current_emission_multiplier_bps(env.clone()),
             ),
+        );
+        env.events().publish(
             (symbol_short!("staking"), symbol_short!("stake")),
             (user, amount, info.lock_end, info.rate_multiplier),
         );
@@ -345,8 +356,10 @@ impl StakingContract {
         token_client.transfer(&env.current_contract_address(), &user, &total_to_send);
 
         env.events().publish(
-            (symbol_short!("withdraw"), user),
+            (symbol_short!("withdraw"), user.clone()),
             (amount_to_return, rewards),
+        );
+        env.events().publish(
             (symbol_short!("staking"), symbol_short!("withdraw")),
             (user, amount_to_return, rewards),
         );

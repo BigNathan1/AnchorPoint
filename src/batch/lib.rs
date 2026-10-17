@@ -113,6 +113,8 @@ impl BatchExecutor {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Nonce(admin), &0u64);
+        env.events()
+            .publish((symbol_short!("init"),), admin);
     }
 
     pub fn execute_batch(env: Env, caller: Address, calls: Vec<Call>) -> Vec<Val> {

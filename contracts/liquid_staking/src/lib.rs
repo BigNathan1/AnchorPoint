@@ -139,6 +139,10 @@ impl LiquidStaking {
         env.storage().instance().set(&DataKey::Paused, &false);
         // Initialise the emergency fee penalty to the default (10%).
         env.storage().instance().set(&DataKey::EmergencyFeeBps, &DEFAULT_EMERGENCY_FEE_BPS);
+        env.events().publish(
+            (symbol_short!("ls_init"),),
+            (admin, stake_token, reward_token, nft_contract),
+        );
     }
 
     pub fn deposit_rewards(env: Env, from: Address, amount: i128) {
@@ -461,6 +465,8 @@ impl LiquidStaking {
         assert!(fee_bps >= 0 && fee_bps <= MAX_BPS, "fee_bps out of range");
 
         env.storage().instance().set(&DataKey::EmergencyFeeBps, &fee_bps);
+        env.events()
+            .publish((symbol_short!("fee_set"), caller), fee_bps);
     }
 
     /// Return the current emergency-withdraw fee in basis points.
@@ -504,12 +510,13 @@ impl LiquidStaking {
                 &reward,
             );
 
-            // Topic: event name only; user + token_id + reward in data.
-            env.events().publish((symbol_short!("claimed"), user, token_id), reward);
-            env.events().publish((symbol_short!("claimed"),), (user, token_id, reward));
         }
 
         Self::_sync_nft_metadata(&env, token_id);
+        env.events()
+            .publish((symbol_short!("claimed"), user.clone(), token_id), reward);
+        env.events()
+            .publish((symbol_short!("claimed"),), (user, token_id, reward));
 
         reward
     }

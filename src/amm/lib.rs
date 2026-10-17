@@ -57,6 +57,10 @@ impl AMM {
         env.storage().instance().set(&DataKey::ReserveB, &0_i128);
         env.storage().instance().set(&DataKey::TotalShares, &0_i128);
         env.storage().instance().set(&DataKey::Paused, &false);
+        env.events().publish(
+            (symbol_short!("pool_init"),),
+            (admin, Self::read_pool_tokens(&env).0, Self::read_pool_tokens(&env).1),
+        );
     }
 
     /// Pauses this AMM pool. Other AMM pool contract instances remain unaffected.
@@ -110,10 +114,37 @@ impl AMM {
             .get(&DataKey::TotalShares)
             .unwrap_or(0);
 
-        // Calculate shares to mint
+        assert!(amount_a > 0 && amount_b > 0, "deposit amounts must be positive");
+
+        // Measure each transfer so fee-on-transfer tokens cannot inflate reserves.
+        let contract_address = env.current_contract_address();
+        let balance_a_before = token_balance(&env, &token_a, &contract_address);
+        let balance_b_before = token_balance(&env, &token_b, &contract_address);
+        transfer(
+            &env,
+            &token_a,
+            &from,
+            &contract_address,
+            amount_a,
+        );
+        transfer(
+            &env,
+            &token_b,
+            &from,
+            &contract_address,
+            amount_b,
+        );
+        let received_a = token_balance(&env, &token_a, &contract_address)
+            .checked_sub(balance_a_before)
+            .expect("token balance decreased during deposit");
+        let received_b = token_balance(&env, &token_b, &contract_address)
+            .checked_sub(balance_b_before)
+            .expect("token balance decreased during deposit");
+        assert!(received_a > 0 && received_b > 0, "no tokens received");
+
+        // Calculate shares from the amounts the pool actually received.
         let shares = if total_shares == 0 {
-            // Initial liquidity = geometric mean
-            let initial_liquidity = sqrt(amount_a.checked_mul(amount_b).expect("deposit overflow"));
+            let initial_liquidity = sqrt(received_a.checked_mul(received_b).expect("deposit overflow"));
             let minimum_liquidity = 1000;
             if initial_liquidity <= minimum_liquidity {
                 panic!("insufficient initial liquidity");
@@ -121,50 +152,29 @@ impl AMM {
             total_shares = minimum_liquidity;
             initial_liquidity.checked_sub(minimum_liquidity).expect("liquidity underflow")
         } else {
-            // Proportional liquidity: min(amount_a/reserve_a, amount_b/reserve_b) * total_shares
-            let shares_a = amount_a
+            let shares_a = received_a
                 .checked_mul(total_shares)
                 .expect("deposit overflow")
                 / reserve_a;
-            let shares_b = amount_b
+            let shares_b = received_b
                 .checked_mul(total_shares)
                 .expect("deposit overflow")
                 / reserve_b;
-            if shares_a < shares_b {
-                shares_a
-            } else {
-                shares_b
-            }
+            if shares_a < shares_b { shares_a } else { shares_b }
         };
 
         if shares <= 0 {
             panic!("insufficient liquidity provided");
         }
 
-        // Transfer tokens into the contract (User -> Contract)
-        transfer(
-            &env,
-            &token_a,
-            &from,
-            &env.current_contract_address(),
-            amount_a,
-        );
-        transfer(
-            &env,
-            &token_b,
-            &from,
-            &env.current_contract_address(),
-            amount_b,
-        );
-
         // Update state
         env.storage().instance().set(
             &DataKey::ReserveA,
-            &reserve_a.checked_add(amount_a).expect("reserve overflow"),
+            &reserve_a.checked_add(received_a).expect("reserve overflow"),
         );
         env.storage().instance().set(
             &DataKey::ReserveB,
-            &reserve_b.checked_add(amount_b).expect("reserve overflow"),
+            &reserve_b.checked_add(received_b).expect("reserve overflow"),
         );
         env.storage().instance().set(
             &DataKey::TotalShares,
@@ -184,7 +194,7 @@ impl AMM {
         // Topic: event name only; from + amounts in data.
         env.events().publish(
             (symbol_short!("deposit"),),
-            (from, amount_a, amount_b, shares),
+            (from, received_a, received_b, shares),
         );
         shares
     }
@@ -441,6 +451,14 @@ fn transfer(env: &Env, token: &Address, from: &Address, to: &Address, amount: i1
     );
 }
 
+fn token_balance(env: &Env, token: &Address, account: &Address) -> i128 {
+    env.invoke_contract::<i128>(
+        token,
+        &symbol_short!("balance"),
+        (account.clone(),).into_val(env),
+    )
+}
+
 /// Babylonian method for integer square root.
 fn sqrt(y: i128) -> i128 {
     if y > 3 {
@@ -489,6 +507,11 @@ mod tests {
         assert_eq!(r_b, 0);
         assert_eq!(client.get_admin(), admin);
         assert!(!client.is_paused());
+        assert_eq!(
+            _env.events().all().len(),
+            1,
+            "initialization emits one pool event"
+        );
     }
 
     #[test]
@@ -545,6 +568,79 @@ mod tests {
 
         client.pause_pool(&admin);
         client.deposit(&user, &100, &100);
+    }
+
+    #[contracttype]
+    enum FeeTokenKey {
+        Balance(Address),
+    }
+
+    #[contract]
+    struct FeeOnTransferToken;
+
+    #[contractimpl]
+    impl FeeOnTransferToken {
+        pub fn mint(env: Env, account: Address, amount: i128) {
+            let balance: i128 = env
+                .storage()
+                .persistent()
+                .get(&FeeTokenKey::Balance(account.clone()))
+                .unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&FeeTokenKey::Balance(account), &(balance + amount));
+        }
+
+        pub fn balance(env: Env, account: Address) -> i128 {
+            env.storage()
+                .persistent()
+                .get(&FeeTokenKey::Balance(account))
+                .unwrap_or(0)
+        }
+
+        pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+            let from_key = FeeTokenKey::Balance(from.clone());
+            let to_key = FeeTokenKey::Balance(to.clone());
+            let from_balance: i128 = env.storage().persistent().get(&from_key).unwrap_or(0);
+            let to_balance: i128 = env.storage().persistent().get(&to_key).unwrap_or(0);
+            let received = amount * 99 / 100;
+            env.storage()
+                .persistent()
+                .set(&from_key, &(from_balance - amount));
+            env.storage()
+                .persistent()
+                .set(&to_key, &(to_balance + received));
+        }
+    }
+
+    #[test]
+    fn test_deposit_uses_received_amount_for_fee_on_transfer_tokens() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let token_a = env.register(FeeOnTransferToken, ());
+        let token_b = env.register(FeeOnTransferToken, ());
+        let contract_id = env.register(AMM, ());
+        let client = AMMClient::new(&env, &contract_id);
+        client.initialize(&admin, &token_a, &token_b);
+        FeeOnTransferTokenClient::new(&env, &token_a).mint(&user, &100_000);
+        FeeOnTransferTokenClient::new(&env, &token_b).mint(&user, &100_000);
+
+        let shares = client.deposit(&user, &100_000, &100_000);
+
+        assert_eq!(client.get_reserves(), (99_000, 99_000));
+        assert_eq!(shares, 98_000);
+        assert_eq!(client.get_total_shares(), 99_000);
+        assert_eq!(
+            FeeOnTransferTokenClient::new(&env, &token_a).balance(&contract_id),
+            99_000
+        );
+        assert_eq!(
+            FeeOnTransferTokenClient::new(&env, &token_b).balance(&contract_id),
+            99_000
+        );
     }
 
     #[test]
@@ -771,23 +867,14 @@ mod tests {
 
         // The mock pool is initialised with the same token on both sides, so
         // token_in and token_out are both the mock.
+        let events = env.events().all();
         assert_eq!(
-            env.events().all(),
-            svec![
-                &env,
-                (
-                    contract_id,
-                    svec![&env, symbol_short!("swap").into_val(&env)],
-                    (
-                        user.clone(),
-                        token_id.clone(),
-                        token_id,
-                        amount_in,
-                        expected_out,
-                    )
-                        .into_val(&env),
-                ),
-            ]
+            events.get(events.len() - 1).unwrap(),
+            (
+                contract_id,
+                svec![&env, symbol_short!("swap").into_val(&env)],
+                (user, token_id.clone(), token_id, amount_in, expected_out).into_val(&env),
+            )
         );
     }
 

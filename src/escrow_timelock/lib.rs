@@ -1,5 +1,5 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env};
 
 #[contracttype]
 #[derive(Clone)]
@@ -54,6 +54,8 @@ impl EscrowTimelock {
         env.storage()
             .instance()
             .set(&soroban_sdk::symbol_short!("sec_reg"), &registry);
+        env.events()
+            .publish((symbol_short!("sec_reg"),), registry);
     }
 
     /// Initialize a time-locked escrow contract
@@ -116,6 +118,10 @@ impl EscrowTimelock {
         // Transfer tokens from sender to this contract
         let token_client = token::Client::new(&e, &details.token);
         token_client.transfer(&sender, e.current_contract_address(), &amount);
+        e.events().publish(
+            (symbol_short!("esc_init"),),
+            (sender, details.recipient, details.token, amount, unlock_time),
+        );
     }
 
     /// Mark conditions as met (can only be called by sender)
@@ -132,6 +138,8 @@ impl EscrowTimelock {
         e.storage()
             .instance()
             .set(&DataKey::EscrowDetails, &details);
+        e.events()
+            .publish((symbol_short!("cond_met"),), details.sender);
     }
 
     /// Cancel a pending timelocked escrow before the lockup window begins.
@@ -192,6 +200,10 @@ impl EscrowTimelock {
                 &contract_balance,
             );
         }
+        e.events().publish(
+            (symbol_short!("esc_cancel"),),
+            (escrow_id, depositor, details.amount),
+        );
     }
 
     /// Claim funds as the recipient (only after unlock_time or if conditions are met)
@@ -244,6 +256,7 @@ impl EscrowTimelock {
         );
 
         details.recipient.require_auth();
+        e.storage().instance().set(&DataKey::RefundClaimed, &true);
 
         // Transfer tokens to recipient
         let token_client = token::Client::new(&e, &details.token);
@@ -256,6 +269,10 @@ impl EscrowTimelock {
                 &contract_balance,
             );
         }
+        e.events().publish(
+            (symbol_short!("esc_claim"),),
+            (details.recipient, details.token, contract_balance),
+        );
     }
 
     /// Request refund as sender (only if unlock_time has passed and recipient hasn't claimed)
@@ -312,6 +329,10 @@ impl EscrowTimelock {
                 &contract_balance,
             );
         }
+        e.events().publish(
+            (symbol_short!("esc_refund"),),
+            (details.sender, details.token, contract_balance),
+        );
     }
 
     /// Designate (or clear, with `None`) the recovery key for this escrow.
@@ -332,11 +353,15 @@ impl EscrowTimelock {
             }
         }
 
-        details.recovery_key = recovery_key;
+        details.recovery_key = recovery_key.clone();
         e.storage()
             .instance()
             .set(&DataKey::EscrowDetails, &details);
         e.storage().instance().remove(&DataKey::PendingBeneficiary);
+        e.events().publish(
+            (symbol_short!("rec_set"),),
+            (details.recipient, recovery_key),
+        );
     }
 
     /// Propose replacing the beneficiary using the designated recovery key.
@@ -370,9 +395,13 @@ impl EscrowTimelock {
         e.storage().instance().set(
             &DataKey::PendingBeneficiary,
             &PendingBeneficiaryUpdate {
-                new_beneficiary,
+                new_beneficiary: new_beneficiary.clone(),
                 effective_at,
             },
+        );
+        e.events().publish(
+            (symbol_short!("ben_req"),),
+            (recovery_key, new_beneficiary, effective_at),
         );
     }
 
@@ -394,11 +423,16 @@ impl EscrowTimelock {
             panic!("beneficiary update timelock not elapsed");
         }
 
-        details.recipient = pending.new_beneficiary;
+        let previous_beneficiary = details.recipient.clone();
+        details.recipient = pending.new_beneficiary.clone();
         e.storage()
             .instance()
             .set(&DataKey::EscrowDetails, &details);
         e.storage().instance().remove(&DataKey::PendingBeneficiary);
+        e.events().publish(
+            (symbol_short!("ben_set"),),
+            (previous_beneficiary, pending.new_beneficiary),
+        );
     }
 
     /// Cancel a pending beneficiary change.
@@ -408,9 +442,11 @@ impl EscrowTimelock {
     pub fn cancel_beneficiary_update(e: Env, caller: Address) {
         let details = Self::load_details(&e);
 
-        if !e.storage().instance().has(&DataKey::PendingBeneficiary) {
-            panic!("no pending beneficiary update");
-        }
+        let pending: PendingBeneficiaryUpdate = e
+            .storage()
+            .instance()
+            .get(&DataKey::PendingBeneficiary)
+            .expect("no pending beneficiary update");
 
         let is_recovery_key = details.recovery_key.as_ref() == Some(&caller);
         if caller != details.recipient && !is_recovery_key {
@@ -419,6 +455,10 @@ impl EscrowTimelock {
         caller.require_auth();
 
         e.storage().instance().remove(&DataKey::PendingBeneficiary);
+        e.events().publish(
+            (symbol_short!("ben_cancel"),),
+            (caller, pending.new_beneficiary),
+        );
     }
 
     /// Get the pending beneficiary change, if any.
@@ -486,7 +526,9 @@ impl EscrowTimelock {
 mod tests {
     use super::*;
     use soroban_sdk::{
-        testutils::Address as _, testutils::Ledger, token::StellarAssetClient, Address, Env,
+        testutils::{Address as _, Events, Ledger},
+        token::StellarAssetClient,
+        vec as svec, Address, Env, IntoVal,
     };
 
     #[test]
@@ -510,6 +552,15 @@ mod tests {
         let details = client.get_escrow_details();
         assert_eq!(details.amount, 500);
         assert_eq!(details.unlock_time, 2000);
+        let events = e.events().all();
+        assert_eq!(
+            events.get(events.len() - 1).unwrap(),
+            (
+                contract_id,
+                svec![&e, soroban_sdk::symbol_short!("esc_init").into_val(&e)],
+                (sender, recipient, token_id, 500_i128, 2000_u64).into_val(&e),
+            )
+        );
     }
 
     #[test]
@@ -683,6 +734,7 @@ mod tests {
         assert_eq!(token_client.balance(&new_beneficiary), 500);
         assert_eq!(token_client.balance(&s.recipient), 0);
         assert_eq!(token_client.balance(&s.contract_id), 0);
+        assert!(s.client.get_refund_claimed());
     }
 
     #[test]

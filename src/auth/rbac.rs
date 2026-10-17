@@ -317,6 +317,8 @@ impl RBACContract {
         env.storage()
             .instance()
             .set(&soroban_sdk::symbol_short!("sec_reg"), &registry);
+        env.events()
+            .publish((symbol_short!("sec_reg"),), registry);
     }
 
     /// Initializes the RBAC contract with an initial administrator.

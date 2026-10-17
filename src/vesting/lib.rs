@@ -40,6 +40,7 @@ impl VestingContract {
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::GrantCounter, &0u32);
+        env.events().publish((symbol_short!("init"),), admin);
     }
 
     /// Transfers administrative rights to a new address.
@@ -51,6 +52,8 @@ impl VestingContract {
             .expect("not initialized");
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.events()
+            .publish((symbol_short!("admin_set"), admin), new_admin);
     }
 
     /// Creates a new vesting grant.
