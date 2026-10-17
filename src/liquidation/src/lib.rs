@@ -1,5 +1,9 @@
 #![no_std]
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, IntoVal, Vec};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
+    Env, IntoVal,
+};
 
 /// Multiplier for 4-decimal-place fixed-point health factor.
 /// 10_000 represents 1.0000 (100%).
@@ -13,7 +17,10 @@ const HF_ONE_BPS: i128 = 10_000;
 
 /// Minimum health factor for a vault to be safe from full liquidation
 /// (1.2000 = 120%).
-const LIQUIDATION_THRESHOLD_BPS: i128 = 12_000;
+const MIN_COLLATERAL_RATIO_BPS: i128 = 12_000;
+
+/// Maximum age of an oracle update accepted for liquidation decisions.
+const MAX_ORACLE_STALENESS_SECONDS: u64 = 300;
 
 /// Minimum health factor for a vault to be safe from partial liquidation
 /// (1.5000 = 150%). Deliberately less strict than full liquidation.
@@ -32,6 +39,13 @@ const LIQUIDATOR_BONUS_BPS: i128 = 500;
 
 /// Basis-point denominator.
 const BPS: i128 = 10_000;
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ContractError {
+    VaultHealthy = 1,
+    OraclePriceStale = 2,
+}
 
 #[contracttype]
 pub struct Vault {
@@ -229,12 +243,35 @@ impl LiquidationEngine {
             &symbol_short!("get_price"),
             soroban_sdk::vec![env, debt_token.into_val(env)],
         );
+        let collateral_price = Self::oracle_price(env, &oracle_id, &collateral_token);
+        let debt_price = Self::oracle_price(env, &oracle_id, &debt_token);
 
         let debt_value = (vault.debt_amount as i128)
             .checked_mul(debt_price)
             .expect("debt value overflow");
 
         (collateral_value, debt_value)
+    }
+
+    fn oracle_price(env: &Env, oracle: &Address, asset: &Address) -> i128 {
+        let price: i128 = env.invoke_contract(
+            oracle,
+            &symbol_short!("get_price"),
+            soroban_sdk::vec![env, asset.clone().into_val(env)],
+        );
+        let updated_at: u64 = env.invoke_contract(
+            oracle,
+            &symbol_short!("get_last_update"),
+            soroban_sdk::vec![env, asset.clone().into_val(env)],
+        );
+        let age = env.ledger().timestamp().saturating_sub(updated_at);
+        if updated_at == 0
+            || updated_at > env.ledger().timestamp()
+            || age > MAX_ORACLE_STALENESS_SECONDS
+        {
+            panic_with_error!(env, ContractError::OraclePriceStale);
+        }
+        price
     }
 
     /// Returns true when a vault is undercollateralised, i.e. its health
@@ -257,10 +294,9 @@ impl LiquidationEngine {
         // oracle-priced and division-by-zero safe: a zero-debt vault reports
         // i128::MAX and is therefore never liquidatable.
         let health_factor = Self::get_health_factor(env.clone(), vault_id);
-        assert!(
-            health_factor < LIQUIDATION_THRESHOLD_BPS,
-            "vault is healthy"
-        );
+        if health_factor >= MIN_COLLATERAL_RATIO_BPS {
+            panic_with_error!(&env, ContractError::VaultHealthy);
+        }
 
         // Liquidator incentive: 5% spread + 10 units fixed fee
         let collateral_total = vault.collateral_amount;
@@ -606,11 +642,14 @@ impl LiquidationEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, testutils::Events, vec as svec};
+    use soroban_sdk::{
+        testutils::Address as _, testutils::Events, testutils::Ledger as _, vec as svec,
+    };
 
     #[contracttype]
     enum MockDataKey {
         Price(Address),
+        UpdatedAt(Address),
     }
 
     #[contract]
@@ -621,7 +660,10 @@ mod tests {
         pub fn set_price(env: Env, asset: Address, price: i128) {
             env.storage()
                 .instance()
-                .set(&MockDataKey::Price(asset), &price);
+                .set(&MockDataKey::Price(asset.clone()), &price);
+            env.storage()
+                .instance()
+                .set(&MockDataKey::UpdatedAt(asset), &env.ledger().timestamp());
         }
 
         pub fn get_price(env: Env, asset: Address) -> i128 {
@@ -630,6 +672,13 @@ mod tests {
                 .get(&MockDataKey::Price(asset))
                 .expect("mock price not set")
         }
+
+        pub fn get_last_update(env: Env, asset: Address) -> u64 {
+            env.storage()
+                .instance()
+                .get(&MockDataKey::UpdatedAt(asset))
+                .unwrap_or(0)
+            }
     }
 
     fn setup() -> (
@@ -641,6 +690,7 @@ mod tests {
     ) {
         let env = Env::default();
         env.mock_all_auths();
+        env.ledger().set_timestamp(1_000);
 
         let collateral_token = Address::generate(&env);
         let debt_token = Address::generate(&env);
@@ -748,7 +798,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "vault is healthy")]
     fn test_liquidate_healthy_vault_panics() {
         let (_env, client, _oracle_id, _ct, _dt) = setup();
         let user = Address::generate(&_env);
@@ -756,7 +805,26 @@ mod tests {
 
         // 2 * $1 = $2 collateral, 1 * $1 = $1 debt → HF = 20000 (> 12000) → not eligible
         let vid = client.create_vault(&user, &2u128, &1u128);
-        client.liquidate(&liquidator, &vid);
+        assert_eq!(
+            client.try_liquidate(&liquidator, &vid),
+            Err(Ok(ContractError::VaultHealthy.into()))
+        );
+    }
+
+    #[test]
+    fn test_liquidate_rejects_stale_oracle_prices() {
+        let (env, client, _oracle_id, _ct, _dt) = setup();
+        let user = Address::generate(&env);
+        let liquidator = Address::generate(&env);
+        let vid = client.create_vault(&user, &1u128, &2u128);
+
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + MAX_ORACLE_STALENESS_SECONDS + 1);
+
+        assert_eq!(
+            client.try_liquidate(&liquidator, &vid),
+            Err(Ok(ContractError::OraclePriceStale.into()))
+        );
     }
 
     #[test]
