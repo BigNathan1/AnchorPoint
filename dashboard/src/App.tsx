@@ -31,6 +31,7 @@ import { SessionTimeoutModal } from './components/Auth/SessionTimeoutModal';
 import { WalletManager } from './lib/wallet';
 import { I18nProvider, useTranslation, type Language } from './i18n/config';
 import { ThemeProvider, useTheme } from './contexts/ThemeContext';
+import { ToastContainer, useToastQueue } from './components/NotificationCenter';
 
 export { useTheme };
 
@@ -566,11 +567,32 @@ const ThemeToggle = () => {
   );
 };
 
+/**
+ * Global toast stack rendered at the application root so that any component
+ * in the tree can dispatch toasts without prop-drilling.
+ *
+ * The queue is managed by `useToastQueue` from NotificationCenter. Async
+ * operations throughout the app import `useToastQueue` or consume the context
+ * created here to push feedback to this stack.
+ */
+const ToastStack: React.FC = () => {
+  const { toasts, push: _push, dismiss, pause, resume } = useToastQueue();
+  return (
+    <ToastContainer
+      toasts={toasts}
+      onDismiss={dismiss}
+      onPause={pause}
+      onResume={resume}
+    />
+  );
+};
+
 const AppRoot = () => (
   <ThemeProvider>
     <I18nProvider>
       <NetworkProvider apiBaseUrl={apiBaseUrl}>
         <App />
+        <ToastStack />
       </NetworkProvider>
     </I18nProvider>
   </ThemeProvider>
