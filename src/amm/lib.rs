@@ -11,7 +11,7 @@ use soroban_sdk::{
 /// Errors returned by the AMM contract.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum AmmError {
+pub enum ContractError {
     /// The calculated output amount is below the caller's minimum threshold.
     SlippageExceeded = 1,
 }
@@ -200,6 +200,13 @@ impl AMM {
     }
 
     /// Swaps tokens using the constant product formula (x * y = k) with a 0.3% fee.
+    ///
+    /// `min_amount_out` is the least amount of the output token the caller
+    /// will accept. Pass a value derived from an off-chain quote to protect
+    /// against price movement and sandwich attacks.
+    ///
+    /// # Panics
+    /// * `ContractError::SlippageExceeded` if the output is below `min_amount_out`.
     pub fn swap(
         env: Env,
         from: Address,
@@ -232,15 +239,6 @@ impl AMM {
             panic!("invalid token for pool");
         };
 
-        // Transfer token_in from user to contract
-        transfer(
-            &env,
-            &token_in,
-            &from,
-            &env.current_contract_address(),
-            amount_in,
-        );
-
         // Constant product formula with 0.3% fee: dy = (reserve_out * dx * 997) / (reserve_in * 1000 + dx * 997)
         let amount_in_with_fee = amount_in.checked_mul(997).expect("swap overflow");
         let numerator = amount_in_with_fee
@@ -253,9 +251,20 @@ impl AMM {
             .expect("swap overflow");
         let amount_out = numerator / denominator;
 
+        // Slippage protection: reject before any funds move if the trade
+        // would return less than the caller is willing to accept.
         if amount_out < min_amount_out {
-            panic_with_error!(env, AmmError::SlippageExceeded);
+            panic_with_error!(env, ContractError::SlippageExceeded);
         }
+
+        // Transfer token_in from user to contract
+        transfer(
+            &env,
+            &token_in,
+            &from,
+            &env.current_contract_address(),
+            amount_in,
+        );
 
         // Update state
         if token_in == token_a {
@@ -500,18 +509,23 @@ mod tests {
 
     #[test]
     fn test_initialization() {
-        let (_env, client, admin, _token_a, _token_b) = setup();
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(AMM, ());
+        let client = AMMClient::new(&env, &contract_id);
+        client.initialize(&admin, &Address::generate(&env), &Address::generate(&env));
+        assert_eq!(
+            env.events().all().filter_by_contract(&contract_id).events().len(),
+            1,
+            "initialization emits one pool event"
+        );
 
         let (r_a, r_b) = client.get_reserves();
         assert_eq!(r_a, 0);
         assert_eq!(r_b, 0);
         assert_eq!(client.get_admin(), admin);
         assert!(!client.is_paused());
-        assert_eq!(
-            _env.events().all().len(),
-            1,
-            "initialization emits one pool event"
-        );
     }
 
     #[test]
@@ -827,7 +841,7 @@ mod tests {
         assert_eq!(actual_out, expected_dy);
     }
 
-    /// Verify that swap reverts with `AmmError::SlippageExceeded` when
+    /// Verify that swap reverts with `ContractError::SlippageExceeded` when
     /// min_amount_out is set higher than what the CPMM formula would produce.
     ///
     /// The revert is a typed contract error raised through `panic_with_error!`,
@@ -845,8 +859,29 @@ mod tests {
         // Demanding exactly 10 out must trigger slippage protection.
         assert_eq!(
             client.try_swap(&user, &token_id, &10, &10),
-            Err(Ok(AmmError::SlippageExceeded.into()))
+            Err(Ok(ContractError::SlippageExceeded.into()))
         );
+    }
+
+    /// Boundary: `min_amount_out == quote` passes, `quote + 1` fails with the
+    /// typed error and leaves the pool reserves untouched.
+    #[test]
+    fn test_min_amount_out_boundary() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _cid, token_id) = setup_amm_with_reserves(&env, 50_000, 80_000);
+        let user = Address::generate(&env);
+
+        let dx: i128 = 2_500;
+        let quote = (dx * 997 * 80_000) / (50_000 * 1000 + dx * 997);
+
+        assert_eq!(
+            client.try_swap(&user, &token_id, &dx, &(quote + 1)),
+            Err(Ok(ContractError::SlippageExceeded.into()))
+        );
+        assert_eq!(client.get_reserves(), (50_000, 80_000));
+
+        assert_eq!(client.swap(&user, &token_id, &dx, &quote), quote);
     }
 
     /// Verify the swap event reports the trader, both tokens and the amounts, so
@@ -867,14 +902,16 @@ mod tests {
 
         // The mock pool is initialised with the same token on both sides, so
         // token_in and token_out are both the mock.
-        let events = env.events().all();
         assert_eq!(
-            events.get(events.len() - 1).unwrap(),
-            (
-                contract_id,
-                svec![&env, symbol_short!("swap").into_val(&env)],
-                (user, token_id.clone(), token_id, amount_in, expected_out).into_val(&env),
-            )
+            env.events().all().filter_by_contract(&contract_id),
+            svec![
+                &env,
+                (
+                    contract_id.clone(),
+                    svec![&env, symbol_short!("swap").into_val(&env)],
+                    (user, token_id.clone(), token_id, amount_in, expected_out).into_val(&env),
+                )
+            ]
         );
     }
 
@@ -916,7 +953,7 @@ mod tests {
         assert!(result.is_err(), "slippage guard must reject out+1");
     }
 
-    /// Verify that swap rejects with AmmError::SlippageExceeded when
+    /// Verify that swap rejects with ContractError::SlippageExceeded when
     /// min_amount_out exceeds the CPMM output for the given trade.
     /// This simulates price slippage: the pool moved and the user gets less
     /// than they specified.
@@ -956,8 +993,8 @@ mod tests {
         env.mock_all_auths();
 
         let admin = Address::generate(&env);
-        let token_a = env.register(SlippageMockToken, ());
-        let token_b = env.register(SlippageMockToken, ());
+        let token_a = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let token_b = env.register_stellar_asset_contract_v2(admin.clone()).address();
 
         let contract_id = env.register(AMM, ());
         let client = AMMClient::new(&env, &contract_id);
@@ -966,11 +1003,17 @@ mod tests {
 
         let lp_user = Address::generate(&env);
         let swapper = Address::generate(&env);
+        for token in [&token_a, &token_b] {
+            let sac = soroban_sdk::token::StellarAssetClient::new(&env, token);
+            sac.mint(&lp_user, &10_000_000);
+            sac.mint(&swapper, &10_000_000);
+        }
 
         // Initial deposit to establish shares and reserves
         client.deposit(&lp_user, &10_000_000, &10_000_000);
 
         let k_before = 10_000_000_i128 * 10_000_000_i128;
+        let initial_total_shares = client.get_total_shares();
 
         for i in 0..100 {
             // Swap alternately A->B and B->A to keep reserves roughly balanced
@@ -985,7 +1028,6 @@ mod tests {
         assert!(k_after > k_before, "LP token value (k) should grow due to fee compounding");
 
         // Verify the value per share increased
-        let initial_total_shares = 10_000_000 - 1000;
         let final_total_shares = client.get_total_shares();
         assert_eq!(initial_total_shares, final_total_shares, "Total shares should not change during swaps");
     }
