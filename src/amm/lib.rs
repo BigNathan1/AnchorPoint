@@ -393,6 +393,52 @@ impl AMM {
             .unwrap_or(0)
     }
 
+    /// Returns the geometric mean NAV per LP share.
+    ///
+    /// The price is defined as:
+    ///   get_share_price = sqrt(reserve_a * reserve_b) / total_shares
+    ///
+    /// This gives a manipulation-resistant value suitable for collateral
+    /// calculations because it is the geometric mean of the two reserves, not
+    /// a simple arithmetic average that can be skewed by a single-sided deposit.
+    ///
+    /// Panics if the pool has no shares outstanding (pool not yet seeded).
+    pub fn get_share_price(env: Env) -> u128 {
+        let reserve_a: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReserveA)
+            .unwrap_or(0);
+        let reserve_b: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReserveB)
+            .unwrap_or(0);
+        let total_shares: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalShares)
+            .unwrap_or(0);
+
+        assert!(total_shares > 0, "no shares outstanding");
+        assert!(reserve_a >= 0 && reserve_b >= 0, "invalid reserves");
+
+        // geometric_mean = sqrt(reserve_a * reserve_b)
+        let product = reserve_a
+            .checked_mul(reserve_b)
+            .expect("reserve product overflow");
+        let geometric_mean = sqrt(product);
+
+        // price per share = geometric_mean / total_shares
+        // Multiply by a precision factor (1e7) to retain sub-unit resolution.
+        let precision: i128 = 10_000_000;
+        let numerator = geometric_mean
+            .checked_mul(precision)
+            .expect("share price overflow");
+
+        (numerator / total_shares) as u128
+    }
+
     /// Returns the administrator authorized to pause and unpause this pool.
     pub fn get_admin(env: Env) -> Address {
         env.storage()
@@ -1226,6 +1272,68 @@ mod fuzz_tests {
 
             assert!(min_shares >= 0, "Shares should never be negative");
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // get_share_price tests
+    // -------------------------------------------------------------------------
+
+    /// Equal-reserve pool: geometric mean = sqrt(1000 * 1000) = 1000.
+    /// With TotalShares also seeded to 1000, price per share = 1000 * 1e7 / 1000 = 1e7.
+    #[test]
+    fn test_get_share_price_equal_reserves() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, contract_id, _token_id) = setup_amm_with_reserves(&env, 1_000, 1_000);
+
+        // Seed total shares so the call is valid.
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::TotalShares, &1_000_i128);
+        });
+
+        let price = client.get_share_price();
+        // geometric_mean = sqrt(1000 * 1000) = 1000
+        // price = (1000 * 10_000_000) / 1000 = 10_000_000
+        assert_eq!(price, 10_000_000u128);
+    }
+
+    /// Unequal-reserve pool: geometric mean < arithmetic mean, confirming the
+    /// manipulation-resistance property.
+    #[test]
+    fn test_get_share_price_unequal_reserves() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        // reserve_a = 4_000_000, reserve_b = 1_000_000
+        // geometric_mean = sqrt(4_000_000 * 1_000_000) = sqrt(4e12) = 2_000_000
+        let (client, contract_id, _token_id) =
+            setup_amm_with_reserves(&env, 4_000_000, 1_000_000);
+
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::TotalShares, &1_000_i128);
+        });
+
+        let price = client.get_share_price();
+        // geometric_mean = 2_000_000
+        // price = (2_000_000 * 10_000_000) / 1_000 = 20_000_000_000
+        assert_eq!(price, 20_000_000_000u128);
+    }
+
+    /// get_share_price panics when there are no shares outstanding (uninitialized pool).
+    #[test]
+    #[should_panic(expected = "no shares outstanding")]
+    fn test_get_share_price_no_shares_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _contract_id, _token_id) = setup_amm_with_reserves(&env, 1_000, 1_000);
+        // TotalShares is left at zero (default from setup_amm_with_reserves).
+        client.get_share_price();
     }
 
     static RNG_STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(12345);
