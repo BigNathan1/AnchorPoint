@@ -55,6 +55,7 @@ import { cleanupWorker } from './workers/cleanup.worker';
 import { feeReportWorker } from './workers/fee-report.worker';
 import contractQueueService from './services/contract-queue.service';
 import { checkMigrationsOnStartup } from './services/migration-check.service';
+import { notifyServerStarted } from './services/startup-notify.service';
 
 let server: ReturnType<typeof app.listen> | null = null;
 let isShuttingDown = false;
@@ -580,6 +581,7 @@ if (process.env.NODE_ENV !== 'test') {
         server = httpServer.listen(PORT, () => {
           logger.info(`Backend service listening at http://localhost:${PORT}`);
           logger.info(`API Documentation available at http://localhost:${PORT}/api-docs`);
+          void notifyServerStarted();
           feeReportScheduler.start();
           uploadExpiryScheduler.start();
           kycExpiryScheduler.start();
