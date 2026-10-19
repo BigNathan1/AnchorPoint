@@ -8,7 +8,14 @@ import {
   passwordResetRequestSchema,
   passwordResetConfirmSchema,
   purgeCacheSchema,
+  adminMfaConfirmSchema,
+  adminLoginSchema,
 } from './admin.schemas';
+import {
+  setupAdminMfa,
+  confirmAdminMfa,
+  loginAdmin,
+} from '../controllers/admin.controller';
 import { stellarService } from '../../services/stellar.service';
 import { NetworkType } from '../../config/networks';
 import { SEP31Service } from '../../services/sep31.service';
@@ -34,6 +41,91 @@ const sep31Service = new SEP31Service(createCallbackNotifier());
 // Admin RBAC: read endpoints accept every role, destructive ones need SUPER_ADMIN or OPS
 const requireReadAccess = requireRole('SUPER_ADMIN', 'OPS', 'READ_ONLY');
 const requireWriteAccess = requireRole('SUPER_ADMIN', 'OPS');
+
+/**
+ * @swagger
+ * /api/admin/login:
+ *   post:
+ *     summary: Authenticate an admin user
+ *     description: Logs in an admin with email and password. Requires a TOTP code (or single-use backup code) when MFA is enabled.
+ *     tags: [Admin]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - email
+ *               - password
+ *             properties:
+ *               email:
+ *                 type: string
+ *                 format: email
+ *               password:
+ *                 type: string
+ *               totpCode:
+ *                 type: string
+ *                 description: 6-digit TOTP code or single-use backup code when MFA is enabled
+ *               code:
+ *                 type: string
+ *                 description: Alias for totpCode
+ *     responses:
+ *       200:
+ *         description: Admin authenticated successfully
+ *       400:
+ *         description: Invalid request payload
+ *       401:
+ *         description: Invalid credentials, MFA required, or invalid TOTP code
+ */
+router.post('/login', validate({ body: adminLoginSchema }), loginAdmin);
+
+/**
+ * @swagger
+ * /api/admin/mfa/setup:
+ *   post:
+ *     summary: Initialize TOTP MFA setup for the authenticated admin
+ *     description: Generates a Base32 TOTP secret, QR code data URL, and 10 single-use backup codes.
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: TOTP secret, QR code, and backup codes generated
+ *       401:
+ *         description: Authentication required
+ */
+router.post('/mfa/setup', requireReadAccess, setupAdminMfa);
+
+/**
+ * @swagger
+ * /api/admin/mfa/confirm:
+ *   post:
+ *     summary: Verify first TOTP code and enable MFA for the authenticated admin
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - code
+ *             properties:
+ *               code:
+ *                 type: string
+ *                 description: 6-digit TOTP code from authenticator app
+ *     responses:
+ *       200:
+ *         description: MFA verified and enabled
+ *       400:
+ *         description: Invalid or expired TOTP code
+ *       401:
+ *         description: Authentication required
+ */
+router.post('/mfa/confirm', requireReadAccess, validate({ body: adminMfaConfirmSchema }), confirmAdminMfa);
 
 /**
  * @swagger
