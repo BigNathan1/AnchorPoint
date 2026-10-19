@@ -14,6 +14,9 @@ jest.mock('../../lib/prisma', () => ({
   user: {
     findUnique: jest.fn().mockResolvedValue({ id: 'user_123', publicKey: 'GBXP...' }),
   },
+  contractEvent: {
+    findMany: jest.fn().mockResolvedValue([]),
+  },
   $queryRaw: jest.fn(),
   $queryRawUnsafe: jest.fn(),
 }));
@@ -96,7 +99,7 @@ describe('Transactions Router', () => {
 
   it('should search transactions by indexed sender value', async () => {
     const eventRows = [{ txHash: 'tx123' }];
-    (prisma.$queryRawUnsafe as jest.Mock).mockResolvedValue(eventRows);
+    (prisma.contractEvent.findMany as jest.Mock).mockResolvedValue(eventRows);
     (prisma.transaction.findMany as jest.Mock).mockResolvedValue([{ id: '1', stellarTxId: 'tx123', amount: '100' }]);
     (prisma.transaction.count as jest.Mock).mockResolvedValue(1);
 
@@ -106,13 +109,37 @@ describe('Transactions Router', () => {
       .query({ sender: 'GABC', page: '1', limit: '10' });
 
     expect(res.statusCode).toEqual(200);
-    expect(prisma.$queryRawUnsafe).toHaveBeenCalled();
+    expect(prisma.contractEvent.findMany).toHaveBeenCalled();
+    expect(prisma.$queryRawUnsafe).not.toHaveBeenCalled();
     expect(prisma.transaction.findMany).toHaveBeenCalledWith(expect.objectContaining({
       where: expect.objectContaining({
         stellarTxId: { in: ['tx123'] },
       }),
     }));
     expect(res.body.data.transactions).toEqual([{ id: '1', stellarTxId: 'tx123', amount: '100' }]);
+  });
+
+  it('treats SQL injection input as a literal filter value', async () => {
+    const injection = `' OR '1'='1`;
+    (prisma.contractEvent.findMany as jest.Mock).mockResolvedValue([]);
+    (prisma.transaction.findMany as jest.Mock).mockResolvedValue([]);
+    (prisma.transaction.count as jest.Mock).mockResolvedValue(0);
+
+    const res = await request(app)
+      .get('/api/transactions')
+      .set('Authorization', `Bearer ${token}`)
+      .query({ sender: injection, memo: injection });
+
+    expect(res.statusCode).toEqual(200);
+    expect(prisma.$queryRawUnsafe).not.toHaveBeenCalled();
+    expect(prisma.contractEvent.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ AND: expect.any(Array) }),
+      }),
+    );
+    const where = (prisma.contractEvent.findMany as jest.Mock).mock.calls[0][0].where;
+    expect(JSON.stringify(where)).toContain(injection);
+    expect(res.body.data.transactions).toEqual([]);
   });
 
   it('should return 500 on database error', async () => {
