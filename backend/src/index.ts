@@ -418,6 +418,51 @@ app.get('/health', async (req: Request, res: Response) => {
   return res.status(200).json(responsePayload);
 });
 
+// Kubernetes liveness probe — never fails if the process is running. No auth.
+app.get('/health/live', (_req: Request, res: Response) => {
+  return res.status(200).json({ status: 'UP', timestamp: new Date().toISOString() });
+});
+
+// Kubernetes readiness probe — DB pool + Soroban RPC (cached, 10s TTL). No auth.
+let sorobanReadyCache: { status: 'UP' | 'DOWN'; checkedAt: number } | null = null;
+const SOROBAN_READY_TTL_MS = 10_000;
+
+async function getCachedSorobanStatus(): Promise<'UP' | 'DOWN'> {
+  const now = Date.now();
+  if (sorobanReadyCache && now - sorobanReadyCache.checkedAt < SOROBAN_READY_TTL_MS) {
+    return sorobanReadyCache.status;
+  }
+  try {
+    const rpcHealth = await withHealthTimeout(stellarService.getHealth(), 'Soroban RPC');
+    sorobanReadyCache = { status: rpcHealth.status, checkedAt: now };
+  } catch {
+    sorobanReadyCache = { status: 'DOWN', checkedAt: now };
+  }
+  return sorobanReadyCache.status;
+}
+
+app.get('/health/ready', async (_req: Request, res: Response) => {
+  const dependencies: Record<string, string> = {};
+  let ready = true;
+
+  try {
+    await withHealthTimeout(prisma.$queryRaw`SELECT 1`, 'Database');
+    dependencies.database = 'UP';
+  } catch {
+    dependencies.database = 'DOWN';
+    ready = false;
+  }
+
+  const sorobanRpc = await getCachedSorobanStatus();
+  dependencies.sorobanRpc = sorobanRpc;
+  if (sorobanRpc !== 'UP') {
+    ready = false;
+  }
+
+  const payload = { status: ready ? 'UP' : 'DOWN', timestamp: new Date().toISOString(), dependencies };
+  return res.status(ready ? 200 : 503).json(payload);
+});
+
 // Swagger API Documentation
 /**
  * @swagger
