@@ -1,4 +1,4 @@
-import React, { useState, useRef, useMemo } from 'react';
+import React, { useState, useRef, useMemo, useEffect } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { 
   ArrowUpRight, 
@@ -15,6 +15,8 @@ import {
   ChevronDown,
   ChevronUp
 } from 'lucide-react';
+import { useTransactionStore } from '../store/transactionStore';
+import { useTransactionSocket } from '../hooks/useTransactionSocket';
 
 export interface Transaction {
   id: string;
@@ -86,10 +88,38 @@ export const TransactionHistory: React.FC<TransactionHistoryProps> = ({
   rowHeight = 56,
   overscan = 15
 }) => {
+  const storeTransactions = useTransactionStore((state) => state.transactions);
+  const setStoreTransactions = useTransactionStore((state) => state.setTransactions);
+  const recentlyUpdatedIds = useTransactionStore((state) => state.recentlyUpdatedIds);
+  const connectionMode = useTransactionStore((state) => state.connectionMode);
+
+  useTransactionSocket();
+
   const [dataCount, setDataCount] = useState<number>(totalInitialCount);
   const [transactions, setTransactions] = useState<Transaction[]>(() => {
-    return initialData ?? generateTransactions(totalInitialCount);
+    if (initialData) return initialData;
+    if (storeTransactions.length === totalInitialCount && storeTransactions.length > 0) {
+      return storeTransactions;
+    }
+    return generateTransactions(totalInitialCount);
   });
+
+  useEffect(() => {
+    if (initialData) {
+      setTransactions(initialData);
+      setStoreTransactions(initialData);
+    } else if (storeTransactions.length === 0 || storeTransactions.length !== totalInitialCount) {
+      const initial = generateTransactions(totalInitialCount);
+      setTransactions(initial);
+      setStoreTransactions(initial);
+    }
+  }, [initialData, totalInitialCount, setStoreTransactions]);
+
+  useEffect(() => {
+    if (storeTransactions.length > 0) {
+      setTransactions(storeTransactions);
+    }
+  }, [storeTransactions]);
 
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedType, setSelectedType] = useState<string>('All');
@@ -155,7 +185,9 @@ export const TransactionHistory: React.FC<TransactionHistoryProps> = ({
 
   const handleToggleVolume = (count: number) => {
     setDataCount(count);
-    setTransactions(generateTransactions(count));
+    const newTxs = generateTransactions(count);
+    setTransactions(newTxs);
+    setStoreTransactions(newTxs);
   };
 
   return (
@@ -164,12 +196,33 @@ export const TransactionHistory: React.FC<TransactionHistoryProps> = ({
       <div className="glass-card p-6 border border-slate-800">
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
           <div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
               <h2 className="text-xl font-bold font-display text-slate-100">
                 Transaction History
               </h2>
               <span className="px-2 py-0.5 rounded-full text-[11px] font-bold bg-primary/20 text-primary border border-primary/30 flex items-center gap-1">
                 <Zap size={12} /> 60 FPS Virtualized
+              </span>
+              <span
+                data-testid="connection-mode-badge"
+                className={`px-2 py-0.5 rounded-full text-[11px] font-bold border flex items-center gap-1.5 transition-colors ${
+                  connectionMode === 'websocket'
+                    ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
+                    : connectionMode === 'polling'
+                    ? 'bg-amber-500/10 text-amber-400 border-amber-500/30'
+                    : 'bg-slate-800 text-slate-400 border-slate-700'
+                }`}
+              >
+                <span
+                  className={`w-1.5 h-1.5 rounded-full ${
+                    connectionMode === 'websocket'
+                      ? 'bg-emerald-400 animate-pulse'
+                      : connectionMode === 'polling'
+                      ? 'bg-amber-400 animate-pulse'
+                      : 'bg-slate-500'
+                  }`}
+                />
+                {connectionMode === 'websocket' ? 'Live WebSocket' : connectionMode === 'polling' ? 'Live Polling' : 'Offline'}
               </span>
             </div>
             <p className="text-sm text-slate-400 mt-1">
@@ -300,13 +353,19 @@ export const TransactionHistory: React.FC<TransactionHistoryProps> = ({
                 const tx = item.tx;
                 if (!tx) return null;
                 const isExpanded = expandedTxIds.has(tx.id);
+                const isRecentlyUpdated = recentlyUpdatedIds.includes(tx.id);
 
                 return (
                   <div
                     key={item.key}
                     data-index={item.index}
                     data-testid={`tx-row-${item.index}`}
-                    className="absolute top-0 left-0 w-full border-b border-slate-800/60 hover:bg-slate-900/60 transition-colors text-sm"
+                    data-animating={isRecentlyUpdated ? 'true' : undefined}
+                    className={`absolute top-0 left-0 w-full border-b border-slate-800/60 hover:bg-slate-900/60 transition-all duration-700 text-sm ${
+                      isRecentlyUpdated
+                        ? 'bg-emerald-500/20 ring-1 ring-inset ring-emerald-500/40 animate-pulse'
+                        : ''
+                    }`}
                     style={{
                       transform: `translateY(${item.start}px)`
                     }}
