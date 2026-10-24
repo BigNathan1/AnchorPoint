@@ -1,5 +1,6 @@
 import React, { useState, useRef, useMemo, useEffect } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
+import { CopyableText } from './CopyableText';
 import { 
   ArrowUpRight, 
   ArrowDownLeft, 
@@ -436,7 +437,7 @@ export const TransactionHistory: React.FC<TransactionHistoryProps> = ({
                       {/* Hash & Counterparty */}
                       <div className="col-span-3">
                         <div className="flex items-center gap-1.5 text-xs font-mono text-slate-300">
-                          <span className="truncate max-w-[140px]">{tx.hash}</span>
+                          <CopyableText value={tx.hash} label="Transaction ID" />
                           <ExternalLink size={11} className="text-slate-500 hover:text-primary cursor-pointer" />
                         </div>
                         <span className="text-[10px] font-mono text-slate-500 block truncate">
@@ -566,7 +567,7 @@ export const TransactionHistory: React.FC<TransactionHistoryProps> = ({
                           <div className="flex items-center justify-between gap-2">
                             <span className="text-slate-400 font-medium">Hash:</span>
                             <div className="flex items-center gap-1.5 font-mono text-slate-300">
-                              <span className="truncate max-w-[140px] sm:max-w-[200px]">{tx.hash}</span>
+                              <CopyableText value={tx.hash} label="Transaction ID" />
                               <ExternalLink size={12} className="text-slate-500 hover:text-primary cursor-pointer shrink-0" />
                             </div>
                           </div>

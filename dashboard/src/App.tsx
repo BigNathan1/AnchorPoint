@@ -26,6 +26,7 @@ import { UserAvatarDropdown } from './components/UserAvatarDropdown';
 import { CopyablePublicKey } from './components/CopyablePublicKey';
 import { WalletModal } from './components/WalletModal';
 import { NetworkSelector, NetworkBanner } from './components/NetworkSelector';
+import { NetworkFeeIndicator } from './components/NetworkFeeIndicator';
 import { NetworkProvider } from './contexts/NetworkContext';
 import { SessionTimeoutModal } from './components/Auth/SessionTimeoutModal';
 import { WalletManager } from './lib/wallet';
@@ -399,6 +400,7 @@ const AppShell = () => {
                 {loadingState === 'error' ? 'Fallback Theme Active' : 'Config Connected'}
               </span>
             </div>
+            <NetworkFeeIndicator apiBaseUrl={apiBaseUrl} />
             <NotificationBell
               apiBaseUrl={apiBaseUrl}
               onViewAll={() => setActiveTab('notifications')}
