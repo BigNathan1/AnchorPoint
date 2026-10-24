@@ -9,7 +9,7 @@
 //! - Automatic 2-hour cooldown when rolling 1-hour volume spikes above a
 //!   configured multiple (default 300%) of the baseline hourly volume
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, IntoVal, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, IntoVal, Symbol, Vec};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -162,6 +162,10 @@ impl CircuitBreaker {
         env.storage()
             .instance()
             .set(&DataKey::AuthorizedBots, &bots);
+        env.events().publish(
+            (symbol_short!("cb_init"),),
+            (admin, oracle, tl, vbps),
+        );
     }
 
     // ── Bot management ────────────────────────────────────────────────────────
@@ -245,7 +249,7 @@ impl CircuitBreaker {
     ///
     /// Permissionless — anyone can call. Fetches the current price from the
     /// oracle, compares it to the stored reference price for `asset`, and trips
-    /// to `PauseTier::All` if the deviation exceeds `volatility_bps`.
+    /// to `PauseTier::SwapOnly` if the deviation exceeds `volatility_bps`.
     /// The reference price is updated on every call.
     pub fn oracle_trip(env: Env, caller: Address, asset: Address) {
         caller.require_auth();
@@ -263,59 +267,71 @@ impl CircuitBreaker {
             (asset.clone(),).into_val(&env),
         );
 
-        assert!(current_price > 0, "oracle returned non-positive price");
+        Self::check_price(&env, caller, asset, current_price);
+    }
+
+    /// Check a trusted oracle price against the stored per-asset reference.
+    /// The configured oracle must authorize the supplied price.
+    pub fn check_and_trip(env: Env, asset: Address, price: i128) -> bool {
+        let oracle: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::OracleContract)
+            .expect("oracle not configured");
+        oracle.require_auth();
+        Self::check_price(&env, oracle, asset, price)
+    }
+
+    fn check_price(env: &Env, caller: Address, asset: Address, price: i128) -> bool {
+        assert!(price > 0, "oracle returned non-positive price");
 
         let volatility_bps: i128 = env
             .storage()
             .instance()
             .get(&DataKey::VolatilityBps)
             .unwrap_or(DEFAULT_VOLATILITY_BPS);
-
-        let maybe_ref: Option<i128> = env
-            .storage()
-            .instance()
-            .get(&DataKey::ReferencePrice(asset.clone()));
-
-        // Always update reference price for the next observation window.
-        env.storage()
-            .instance()
-            .set(&DataKey::ReferencePrice(asset.clone()), &current_price);
+        let key = DataKey::ReferencePrice(asset.clone());
+        let maybe_ref: Option<i128> = env.storage().instance().get(&key);
+        env.storage().instance().set(&key, &price);
 
         let ref_price = match maybe_ref {
             None => {
-                // First observation — store and return without tripping.
                 env.events().publish(
                     (symbol_short!("cb"), symbol_short!("ref_set")),
-                    (asset, current_price),
+                    (asset, price),
                 );
-                return;
+                return false;
             }
-            Some(p) => p,
+            Some(reference) => reference,
         };
 
-        // deviation_bps = |current - ref| * 10_000 / ref
-        let diff = if current_price > ref_price {
-            current_price - ref_price
+        let diff = if price > ref_price {
+            price.checked_sub(ref_price).expect("price diff overflow")
         } else {
-            ref_price - current_price
+            ref_price.checked_sub(price).expect("price diff overflow")
         };
         let deviation_bps = diff
             .checked_mul(10_000)
             .expect("overflow in deviation calc")
             / ref_price;
 
-        if deviation_bps >= volatility_bps {
-            Self::apply_trip(&env, PauseTier::All, TriggerSource::Oracle, caller.clone());
-            // Topic: event name only; asset + deviation data in payload.
+        if deviation_bps > volatility_bps {
+            Self::apply_trip(env, PauseTier::SwapOnly, TriggerSource::Oracle, caller);
             env.events().publish(
-                (symbol_short!("cb"), symbol_short!("vol_trip")),
+                (Symbol::new(env, "CircuitBreakerTripped"),),
                 (asset.clone(), deviation_bps, volatility_bps),
             );
+            env.events().publish(
+                (symbol_short!("cb"), symbol_short!("vol_trip")),
+                (asset, deviation_bps, volatility_bps),
+            );
+            true
         } else {
             env.events().publish(
                 (symbol_short!("cb"), symbol_short!("vol_ok")),
-                (asset.clone(), deviation_bps, volatility_bps),
+                (asset, deviation_bps, volatility_bps),
             );
+            false
         }
     }
 
@@ -905,6 +921,30 @@ mod tests {
         c.initialize(&admin, &oracle, &3600u64, &500i128);
         // second call must panic
         c.initialize(&admin, &oracle, &3600u64, &500i128);
+    }
+
+    #[test]
+    fn test_check_and_trip_within_threshold_does_not_trip() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_admin, c) = setup_cb(&env);
+        let asset = Address::generate(&env);
+
+        assert!(!c.check_and_trip(&asset, &100i128));
+        assert!(!c.check_and_trip(&asset, &104i128));
+        assert_eq!(c.get_pause_tier(), PauseTier::None);
+    }
+
+    #[test]
+    fn test_check_and_trip_above_threshold_trips_swap_only() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_admin, c) = setup_cb(&env);
+        let asset = Address::generate(&env);
+
+        assert!(!c.check_and_trip(&asset, &100i128));
+        assert!(c.check_and_trip(&asset, &106i128));
+        assert_eq!(c.get_pause_tier(), PauseTier::SwapOnly);
     }
 
     // ── Tiered pausing ────────────────────────────────────────────────────────

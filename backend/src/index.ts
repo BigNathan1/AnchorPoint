@@ -56,6 +56,7 @@ import { cleanupWorker } from './workers/cleanup.worker';
 import { feeReportWorker } from './workers/fee-report.worker';
 import contractQueueService from './services/contract-queue.service';
 import { checkMigrationsOnStartup } from './services/migration-check.service';
+import { notifyServerStarted } from './services/startup-notify.service';
 
 let server: ReturnType<typeof app.listen> | null = null;
 let isShuttingDown = false;
@@ -186,7 +187,13 @@ const corsOptions = {
   optionsSuccessStatus: 200,
 };
 app.use(cors(corsOptions));
-app.use(express.json());
+app.use(
+  express.json({
+    verify: (req: Request & { rawBody?: string }, _res: Response, buf: Buffer) => {
+      req.rawBody = buf.toString('utf8');
+    },
+  }),
+);
 app.use(express.urlencoded({ extended: true }));
 app.use(sanitizeRequestMiddleware);
 
@@ -252,6 +259,17 @@ app.get('/', (req: Request, res: Response) => {
  *                     kycProvider:
  *                       type: string
  *                       example: UP
+ *                     databasePool:
+ *                       type: object
+ *                       properties:
+ *                         active:
+ *                           type: integer
+ *                           nullable: true
+ *                         limit:
+ *                           type: integer
+ *                         utilization:
+ *                           type: number
+ *                           nullable: true
  *       503:
  *         description: One or more backend dependencies are down
  *         content:
@@ -403,6 +421,7 @@ app.get('/health', async (req: Request, res: Response) => {
       horizon: horizonStatus,
       kms: kmsStatus,
       kycProvider: kycProviderStatus,
+      databasePool: dbMetricsScheduler.getPoolUtilization(),
     },
   };
 
@@ -411,6 +430,51 @@ app.get('/health', async (req: Request, res: Response) => {
   }
 
   return res.status(200).json(responsePayload);
+});
+
+// Kubernetes liveness probe — never fails if the process is running. No auth.
+app.get('/health/live', (_req: Request, res: Response) => {
+  return res.status(200).json({ status: 'UP', timestamp: new Date().toISOString() });
+});
+
+// Kubernetes readiness probe — DB pool + Soroban RPC (cached, 10s TTL). No auth.
+let sorobanReadyCache: { status: 'UP' | 'DOWN'; checkedAt: number } | null = null;
+const SOROBAN_READY_TTL_MS = 10_000;
+
+async function getCachedSorobanStatus(): Promise<'UP' | 'DOWN'> {
+  const now = Date.now();
+  if (sorobanReadyCache && now - sorobanReadyCache.checkedAt < SOROBAN_READY_TTL_MS) {
+    return sorobanReadyCache.status;
+  }
+  try {
+    const rpcHealth = await withHealthTimeout(stellarService.getHealth(), 'Soroban RPC');
+    sorobanReadyCache = { status: rpcHealth.status, checkedAt: now };
+  } catch {
+    sorobanReadyCache = { status: 'DOWN', checkedAt: now };
+  }
+  return sorobanReadyCache.status;
+}
+
+app.get('/health/ready', async (_req: Request, res: Response) => {
+  const dependencies: Record<string, string> = {};
+  let ready = true;
+
+  try {
+    await withHealthTimeout(prisma.$queryRaw`SELECT 1`, 'Database');
+    dependencies.database = 'UP';
+  } catch {
+    dependencies.database = 'DOWN';
+    ready = false;
+  }
+
+  const sorobanRpc = await getCachedSorobanStatus();
+  dependencies.sorobanRpc = sorobanRpc;
+  if (sorobanRpc !== 'UP') {
+    ready = false;
+  }
+
+  const payload = { status: ready ? 'UP' : 'DOWN', timestamp: new Date().toISOString(), dependencies };
+  return res.status(ready ? 200 : 503).json(payload);
 });
 
 // Swagger API Documentation
@@ -512,6 +576,7 @@ if (process.env.NODE_ENV !== 'test') {
       STELLAR_FEE_BUMP_SECRET: process.env.STELLAR_FEE_BUMP_SECRET,
       RELAYER_SECRET_KEY: process.env.RELAYER_SECRET_KEY,
       WEBHOOK_SECRET: process.env.WEBHOOK_SECRET,
+      HORIZON_WEBHOOK_SECRET: process.env.HORIZON_WEBHOOK_SECRET,
       SIGNING_KEY: process.env.SIGNING_KEY,
     });
 
@@ -531,6 +596,7 @@ if (process.env.NODE_ENV !== 'test') {
         server = httpServer.listen(PORT, () => {
           logger.info(`Backend service listening at http://localhost:${PORT}`);
           logger.info(`API Documentation available at http://localhost:${PORT}/api-docs`);
+          void notifyServerStarted();
           feeReportScheduler.start();
           uploadExpiryScheduler.start();
           kycExpiryScheduler.start();

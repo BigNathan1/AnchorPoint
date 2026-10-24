@@ -1,5 +1,9 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, IntoVal};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, IntoVal, Vec};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
+    Env, IntoVal,
+};
 
 /// Multiplier for 4-decimal-place fixed-point health factor.
 /// 10_000 represents 1.0000 (100%).
@@ -13,7 +17,10 @@ const HF_ONE_BPS: i128 = 10_000;
 
 /// Minimum health factor for a vault to be safe from full liquidation
 /// (1.2000 = 120%).
-const LIQUIDATION_THRESHOLD_BPS: i128 = 12_000;
+const MIN_COLLATERAL_RATIO_BPS: i128 = 12_000;
+
+/// Maximum age of an oracle update accepted for liquidation decisions.
+const MAX_ORACLE_STALENESS_SECONDS: u64 = 300;
 
 /// Minimum health factor for a vault to be safe from partial liquidation
 /// (1.5000 = 150%). Deliberately less strict than full liquidation.
@@ -33,10 +40,20 @@ const LIQUIDATOR_BONUS_BPS: i128 = 500;
 /// Basis-point denominator.
 const BPS: i128 = 10_000;
 
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ContractError {
+    VaultHealthy = 1,
+    OraclePriceStale = 2,
+}
+
 #[contracttype]
 pub struct Vault {
     pub owner: Address,
+    /// Sum of collateral token units, retained for existing clients. For
+    /// multi-asset vaults, use `collateral_tokens` for per-token amounts.
     pub collateral_amount: u128,
+    pub collateral_tokens: Vec<(Address, u128)>,
     pub debt_amount: u128,
 }
 
@@ -79,6 +96,10 @@ impl LiquidationEngine {
             .set(&DataKey::DebtToken, &debt_token);
         env.storage().instance().set(&DataKey::NextVaultId, &1u32);
         env.storage().instance().set(&DataKey::TotalDebtIssued, &0u128);
+        env.events().publish(
+            (symbol_short!("liq_init"),),
+            (oracle_id, collateral_token, debt_token),
+        );
     }
 
     pub fn set_debt_ceiling(env: Env, ceiling: u128) {
@@ -87,6 +108,8 @@ impl LiquidationEngine {
         env.storage()
             .instance()
             .set(&DataKey::ReserveCollateral, &0_i128);
+        env.events()
+            .publish((symbol_short!("debt_cap"),), ceiling);
     }
 
     pub fn create_vault(env: Env, owner: Address, collateral: u128, debt: u128) -> u32 {
@@ -106,6 +129,7 @@ impl LiquidationEngine {
         let vault = Vault {
             owner: owner.clone(),
             collateral_amount: collateral,
+            collateral_tokens: soroban_sdk::vec![&env, (collateral_token, collateral)],
             debt_amount: debt,
         };
         env.storage().persistent().set(&DataKey::Vaults(id), &vault);
@@ -114,7 +138,47 @@ impl LiquidationEngine {
             &DataKey::NextVaultId,
             &id.checked_add(1).expect("vault id overflow"),
         );
+        env.events()
+            .publish((symbol_short!("vault_new"),), (id, owner, collateral, debt));
         id
+    }
+
+    /// Adds collateral of any oracle-supported token to an existing vault.
+    pub fn add_collateral(env: Env, vault_id: u32, token: Address, amount: u128) {
+        assert!(amount > 0, "collateral amount must be positive");
+        let mut vault: Vault = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Vaults(vault_id))
+            .expect("vault not found");
+        vault.owner.require_auth();
+
+        let mut updated = Vec::new(&env);
+        let mut matched = false;
+        for (existing_token, existing_amount) in vault.collateral_tokens.iter() {
+            if existing_token == token {
+                updated.push_back((existing_token, existing_amount.checked_add(amount).expect("collateral overflow")));
+                matched = true;
+            } else {
+                updated.push_back((existing_token, existing_amount));
+            }
+        }
+        if !matched {
+            updated.push_back((token.clone(), amount));
+        }
+        vault.collateral_tokens = updated;
+        vault.collateral_amount = vault
+            .collateral_amount
+            .checked_add(amount)
+            .expect("collateral overflow");
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Vaults(vault_id), &vault);
+        env.events().publish(
+            (symbol_short!("coll_add"),),
+            (vault_id, vault.owner, token, amount),
+        );
     }
 
     /// Returns the health factor for a vault, formatted to 4 decimal places.
@@ -157,32 +221,57 @@ impl LiquidationEngine {
             .expect("vault not found");
 
         let oracle_id: Address = env.storage().instance().get(&DataKey::OracleId).unwrap();
-        let collateral_token: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::CollateralToken)
-            .unwrap();
         let debt_token: Address = env.storage().instance().get(&DataKey::DebtToken).unwrap();
 
-        let collateral_price: i128 = env.invoke_contract(
-            &oracle_id,
-            &symbol_short!("get_price"),
-            soroban_sdk::vec![env, collateral_token.into_val(env)],
-        );
+        let mut collateral_value = 0_i128;
+        for (collateral_token, amount) in vault.collateral_tokens.iter() {
+            let collateral_price: i128 = env.invoke_contract(
+                &oracle_id,
+                &symbol_short!("get_price"),
+                soroban_sdk::vec![env, collateral_token.into_val(env)],
+            );
+            collateral_value = collateral_value
+                .checked_add(
+                    (amount as i128)
+                        .checked_mul(collateral_price)
+                        .expect("collateral value overflow"),
+                )
+                .expect("collateral value overflow");
+        }
         let debt_price: i128 = env.invoke_contract(
             &oracle_id,
             &symbol_short!("get_price"),
             soroban_sdk::vec![env, debt_token.into_val(env)],
         );
+        let collateral_price = Self::oracle_price(env, &oracle_id, &collateral_token);
+        let debt_price = Self::oracle_price(env, &oracle_id, &debt_token);
 
-        let collateral_value = (vault.collateral_amount as i128)
-            .checked_mul(collateral_price)
-            .expect("collateral value overflow");
         let debt_value = (vault.debt_amount as i128)
             .checked_mul(debt_price)
             .expect("debt value overflow");
 
         (collateral_value, debt_value)
+    }
+
+    fn oracle_price(env: &Env, oracle: &Address, asset: &Address) -> i128 {
+        let price: i128 = env.invoke_contract(
+            oracle,
+            &symbol_short!("get_price"),
+            soroban_sdk::vec![env, asset.clone().into_val(env)],
+        );
+        let updated_at: u64 = env.invoke_contract(
+            oracle,
+            &symbol_short!("get_last_update"),
+            soroban_sdk::vec![env, asset.clone().into_val(env)],
+        );
+        let age = env.ledger().timestamp().saturating_sub(updated_at);
+        if updated_at == 0
+            || updated_at > env.ledger().timestamp()
+            || age > MAX_ORACLE_STALENESS_SECONDS
+        {
+            panic_with_error!(env, ContractError::OraclePriceStale);
+        }
+        price
     }
 
     /// Returns true when a vault is undercollateralised, i.e. its health
@@ -205,14 +294,13 @@ impl LiquidationEngine {
         // oracle-priced and division-by-zero safe: a zero-debt vault reports
         // i128::MAX and is therefore never liquidatable.
         let health_factor = Self::get_health_factor(env.clone(), vault_id);
-        assert!(
-            health_factor < LIQUIDATION_THRESHOLD_BPS,
-            "vault is healthy"
-        );
+        if health_factor >= MIN_COLLATERAL_RATIO_BPS {
+            panic_with_error!(&env, ContractError::VaultHealthy);
+        }
 
         // Liquidator incentive: 5% spread + 10 units fixed fee
-        let incentive = vault
-            .collateral_amount
+        let collateral_total = vault.collateral_amount;
+        let incentive = collateral_total
             .checked_mul(5)
             .expect("incentive overflow")
             / 100
@@ -223,6 +311,10 @@ impl LiquidationEngine {
         env.storage().instance().set(&DataKey::TotalDebtIssued, &total_debt);
 
         vault.collateral_amount = 0;
+        for index in 0..vault.collateral_tokens.len() {
+            let (token, _) = vault.collateral_tokens.get(index).unwrap();
+            vault.collateral_tokens.set(index, (token, 0));
+        }
         vault.debt_amount = 0; // Assume debt fully cleared by liquidation
 
         env.storage()
@@ -247,7 +339,10 @@ impl LiquidationEngine {
             .get(&DataKey::Vaults(vault_id))
             .expect("vault not found");
 
-        Self::target_cover(vault.collateral_amount, vault.debt_amount)
+        let (collateral_value, debt_value) = Self::vault_values(&env, vault_id);
+        let collateral_in_debt_units =
+            Self::collateral_in_debt_units(collateral_value, debt_value, vault.debt_amount);
+        Self::target_cover(collateral_in_debt_units, vault.debt_amount)
     }
 
     /// Partial liquidation: the liquidator asks to cover `debt_to_cover` and the
@@ -285,35 +380,52 @@ impl LiquidationEngine {
             "vault is healthy for partial liquidation"
         );
 
-        let covered = Self::partial_cover_for(&vault, debt_to_cover);
+        let (collateral_value, debt_value) = Self::vault_values(&env, vault_id);
+        let collateral_in_debt_units =
+            Self::collateral_in_debt_units(collateral_value, debt_value, vault.debt_amount);
+        let covered =
+            Self::partial_cover_for(&vault, debt_to_cover, collateral_in_debt_units);
         assert!(covered > 0, "nothing to liquidate");
 
         // Collateral seized proportionally to the debt being repaid.
-        let collateral_ratio = vault.collateral_amount / vault.debt_amount;
-        let collateral_to_liquidate = covered
-            .checked_mul(collateral_ratio)
-            .expect("collateral to liquidate overflow");
-
-        // Liquidator incentive: 5% of the collateral seized.
-        let incentive = collateral_to_liquidate
-            .checked_mul(LIQUIDATOR_BONUS_BPS as u128)
-            .expect("incentive overflow")
-            / BPS as u128;
-
-        let total_seized = collateral_to_liquidate
-            .checked_add(incentive)
-            .expect("seized collateral overflow");
+        let mut collateral_to_liquidate = 0_u128;
+        let mut incentive = 0_u128;
+        let mut updated_collateral = Vec::new(&env);
+        for (token, amount) in vault.collateral_tokens.iter() {
+            let base_seized = amount
+                .checked_mul(covered)
+                .expect("collateral to liquidate overflow")
+                / vault.debt_amount;
+            let bonus = base_seized
+                .checked_mul(LIQUIDATOR_BONUS_BPS as u128)
+                .expect("incentive overflow")
+                / BPS as u128;
+            let total_seized = base_seized
+                .checked_add(bonus)
+                .expect("seized collateral overflow");
+            updated_collateral.push_back((
+                token,
+                amount
+                    .checked_sub(total_seized)
+                    .expect("insufficient collateral to seize"),
+            ));
+            collateral_to_liquidate = collateral_to_liquidate
+                .checked_add(base_seized)
+                .expect("collateral to liquidate overflow");
+            incentive = incentive.checked_add(bonus).expect("incentive overflow");
+        }
+        vault.collateral_tokens = updated_collateral;
         vault.collateral_amount = vault
-            .collateral_amount
-            .checked_sub(total_seized)
-            .expect("insufficient collateral to seize");
+            .collateral_tokens
+            .iter()
+            .fold(0_u128, |total, (_, amount)| total.saturating_add(amount));
         vault.debt_amount = vault
             .debt_amount
             .checked_sub(covered)
             .expect("debt underflow");
 
         let mut total_debt: u128 = env.storage().instance().get(&DataKey::TotalDebtIssued).unwrap_or(0);
-        total_debt = total_debt.checked_sub(liquidate_amount).expect("total debt underflow");
+        total_debt = total_debt.checked_sub(covered).expect("total debt underflow");
         env.storage().instance().set(&DataKey::TotalDebtIssued, &total_debt);
 
         env.storage()
@@ -344,6 +456,8 @@ impl LiquidationEngine {
         env.storage()
             .instance()
             .set(&DataKey::ReserveDebt, &reserve);
+        env.events()
+            .publish((symbol_short!("res_fund"),), (from, amount, reserve));
         reserve
     }
 
@@ -420,6 +534,10 @@ impl LiquidationEngine {
         // cleared vault stays queryable for accounting and audit.
         vault.debt_amount = 0;
         vault.collateral_amount = 0;
+        for index in 0..vault.collateral_tokens.len() {
+            let (token, _) = vault.collateral_tokens.get(index).unwrap();
+            vault.collateral_tokens.set(index, (token, 0));
+        }
         env.storage()
             .persistent()
             .set(&DataKey::Vaults(vault_id), &vault);
@@ -432,7 +550,11 @@ impl LiquidationEngine {
         );
     /// Debt actually repaid for a `requested` cover, after the 50% per-call cap
     /// and the 1.25 target clamp. `vault.debt_amount` is non-zero here.
-    fn partial_cover_for(vault: &Vault, requested: u128) -> u128 {
+    fn partial_cover_for(
+        vault: &Vault,
+        requested: u128,
+        collateral_in_debt_units: u128,
+    ) -> u128 {
         // At most half the outstanding debt per call. Never rounded down to
         // zero, so a dust-sized vault stays liquidatable.
         let max_cover = (vault.debt_amount * MAX_PARTIAL_COVER_BPS as u128 / BPS as u128).max(1);
@@ -440,10 +562,28 @@ impl LiquidationEngine {
         // Never repay more than the vault needs to reach the target. A target of
         // zero means the vault is already at or above it, so the liquidator's
         // request stands and only the cap applies.
-        let needed = Self::target_cover(vault.collateral_amount, vault.debt_amount);
+        let needed = Self::target_cover(collateral_in_debt_units, vault.debt_amount);
         let target_clamp = if needed == 0 { u128::MAX } else { needed };
 
         requested.min(max_cover).min(target_clamp)
+    }
+
+    fn collateral_in_debt_units(
+        collateral_value: i128,
+        debt_value: i128,
+        debt_amount: u128,
+    ) -> u128 {
+        if debt_value <= 0 {
+            return 0;
+        }
+
+        let debt_amount = debt_amount as i128;
+        collateral_value
+            .checked_mul(debt_amount)
+            .expect("collateral conversion overflow")
+            .checked_div(debt_value)
+            .expect("debt value is zero")
+            .max(0) as u128
     }
 
     /// Smallest debt repayment that lifts a vault to the 1.25 target, capped at
@@ -502,11 +642,14 @@ impl LiquidationEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, testutils::Events, vec as svec};
+    use soroban_sdk::{
+        testutils::Address as _, testutils::Events, testutils::Ledger as _, vec as svec,
+    };
 
     #[contracttype]
     enum MockDataKey {
         Price(Address),
+        UpdatedAt(Address),
     }
 
     #[contract]
@@ -517,7 +660,10 @@ mod tests {
         pub fn set_price(env: Env, asset: Address, price: i128) {
             env.storage()
                 .instance()
-                .set(&MockDataKey::Price(asset), &price);
+                .set(&MockDataKey::Price(asset.clone()), &price);
+            env.storage()
+                .instance()
+                .set(&MockDataKey::UpdatedAt(asset), &env.ledger().timestamp());
         }
 
         pub fn get_price(env: Env, asset: Address) -> i128 {
@@ -526,6 +672,13 @@ mod tests {
                 .get(&MockDataKey::Price(asset))
                 .expect("mock price not set")
         }
+
+        pub fn get_last_update(env: Env, asset: Address) -> u64 {
+            env.storage()
+                .instance()
+                .get(&MockDataKey::UpdatedAt(asset))
+                .unwrap_or(0)
+            }
     }
 
     fn setup() -> (
@@ -537,6 +690,7 @@ mod tests {
     ) {
         let env = Env::default();
         env.mock_all_auths();
+        env.ledger().set_timestamp(1_000);
 
         let collateral_token = Address::generate(&env);
         let debt_token = Address::generate(&env);
@@ -574,6 +728,26 @@ mod tests {
         let vid = client.create_vault(&user, &2u128, &1u128);
         let hf = client.get_health_factor(&vid);
         assert_eq!(hf, 20_000);
+    }
+
+    #[test]
+    fn test_add_collateral_from_multiple_tokens_updates_health_factor() {
+        let (env, client, _oracle_id, _collateral_token, second_token) = setup();
+        let user = Address::generate(&env);
+        let vault_id = client.create_vault(&user, &2u128, &1u128);
+        assert_eq!(client.get_health_factor(&vault_id), 20_000);
+
+        client.add_collateral(&vault_id, &second_token, &1u128);
+
+        assert_eq!(client.get_health_factor(&vault_id), 30_000);
+        assert_eq!(
+            env.events().all().get(2).unwrap(),
+            (
+                client.address.clone(),
+                svec![&env, symbol_short!("coll_add").into_val(&env)],
+                (vault_id, user, second_token, 1u128).into_val(&env),
+            )
+        );
     }
 
     #[test]
@@ -624,7 +798,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "vault is healthy")]
     fn test_liquidate_healthy_vault_panics() {
         let (_env, client, _oracle_id, _ct, _dt) = setup();
         let user = Address::generate(&_env);
@@ -632,7 +805,26 @@ mod tests {
 
         // 2 * $1 = $2 collateral, 1 * $1 = $1 debt → HF = 20000 (> 12000) → not eligible
         let vid = client.create_vault(&user, &2u128, &1u128);
-        client.liquidate(&liquidator, &vid);
+        assert_eq!(
+            client.try_liquidate(&liquidator, &vid),
+            Err(Ok(ContractError::VaultHealthy.into()))
+        );
+    }
+
+    #[test]
+    fn test_liquidate_rejects_stale_oracle_prices() {
+        let (env, client, _oracle_id, _ct, _dt) = setup();
+        let user = Address::generate(&env);
+        let liquidator = Address::generate(&env);
+        let vid = client.create_vault(&user, &1u128, &2u128);
+
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + MAX_ORACLE_STALENESS_SECONDS + 1);
+
+        assert_eq!(
+            client.try_liquidate(&liquidator, &vid),
+            Err(Ok(ContractError::OraclePriceStale.into()))
+        );
     }
 
     #[test]
@@ -955,18 +1147,14 @@ mod tests {
         client.fund_reserve(&funder, &200);
         client.liquidate_bad_debt(&vid);
 
-        // `all()` reports the most recent invocation, i.e. the bad-debt call.
-        // Topics: (baddebt); data: (vault_id, debt_cleared, collateral, shortfall).
+        let events = _env.events().all();
         assert_eq!(
-            _env.events().all(),
-            svec![
-                &_env,
-                (
-                    client.address.clone(),
-                    svec![&_env, symbol_short!("baddebt").into_val(&_env)],
-                    (vid, 2i128, 1i128, 100_000_000i128).into_val(&_env),
-                ),
-            ]
+            events.get(events.len() - 1).unwrap(),
+            (
+                client.address.clone(),
+                svec![&_env, symbol_short!("baddebt").into_val(&_env)],
+                (vid, 2i128, 1i128, 100_000_000i128).into_val(&_env),
+            )
         );
     /// A vault one step from the liquidation line: 119_000 collateral against
     /// 100_000 debt at equal prices → HF = 11_900 (1.1900). Repaying the debt

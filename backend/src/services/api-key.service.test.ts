@@ -46,4 +46,18 @@ describe('ApiKeyService', () => {
       })
     });
   });
+
+  it('generates keys matching the expected storage format', async () => {
+    (prisma.apiKey.create as jest.Mock).mockImplementation(({ data }: any) => Promise.resolve({
+      id: '2',
+      key: data.key,
+      ownerId: data.ownerId,
+      tier: data.tier,
+      isActive: true,
+      createdAt: new Date(),
+    }));
+
+    const result = await service.createKey('user1', 'Pro');
+    expect(result.key).toMatch(/^[a-f0-9]{48}$/);
+  });
 });

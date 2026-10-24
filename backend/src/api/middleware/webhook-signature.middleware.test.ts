@@ -247,4 +247,22 @@ describe('webhookSignatureMiddleware', () => {
     middleware(req, res, next);
     expect(next).toHaveBeenCalledTimes(1);
   });
+
+  it('accepts composite X-Stellar-Signature header with embedded timestamp', () => {
+    const middleware = webhookSignatureMiddleware({
+      secrets: secret,
+      signatureHeader: 'x-stellar-signature',
+    });
+    const sig = computeWebhookSignature(payload, secret, ts);
+    const req = makeMockReq({
+      headers: {
+        'x-stellar-signature': `t=${ts},v1=${sig.replace(/^sha256=/, '')}`,
+      },
+      rawBody: payload,
+    });
+    const { res } = makeMockRes();
+    const next = jest.fn();
+    middleware(req, res, next);
+    expect(next).toHaveBeenCalledTimes(1);
+  });
 });

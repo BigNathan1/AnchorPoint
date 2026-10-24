@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env};
 
 #[contracttype]
 #[derive(Clone)]
@@ -39,12 +39,10 @@ impl SecurityRegistry {
         }
         env.storage().instance().set(&DataKey::SuperAdmin, &admin);
         env.storage().instance().set(&DataKey::IsPaused, &false);
+        env.events()
+            .publish((symbol_short!("init"),), admin);
 
-        anchorpoint_utils::storage::extend_instance_ttl(
-            &env,
-            anchorpoint_utils::storage::INSTANCE_THRESHOLD,
-            anchorpoint_utils::storage::INSTANCE_EXTEND_TO,
-        );
+        anchorpoint_utils::storage::extend_instance_ttl(&env);
     }
 
     // -------------------------------------------------------------------------
@@ -72,12 +70,10 @@ impl SecurityRegistry {
         env.storage()
             .instance()
             .set(&DataKey::PendingAdmin, &proposed_admin);
+        env.events()
+            .publish((symbol_short!("adm_prop"), current_admin), proposed_admin);
 
-        anchorpoint_utils::storage::extend_instance_ttl(
-            &env,
-            anchorpoint_utils::storage::INSTANCE_THRESHOLD,
-            anchorpoint_utils::storage::INSTANCE_EXTEND_TO,
-        );
+        anchorpoint_utils::storage::extend_instance_ttl(&env);
     }
 
     /// Accept a pending nomination, completing the admin transfer.
@@ -93,16 +89,19 @@ impl SecurityRegistry {
         if proposed_admin != pending {
             panic!("not pending admin");
         }
+        let old_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::SuperAdmin)
+            .expect("not initialized");
         env.storage()
             .instance()
             .set(&DataKey::SuperAdmin, &proposed_admin);
         env.storage().instance().remove(&DataKey::PendingAdmin);
+        env.events()
+            .publish((symbol_short!("adm_xfer"),), (old_admin, proposed_admin));
 
-        anchorpoint_utils::storage::extend_instance_ttl(
-            &env,
-            anchorpoint_utils::storage::INSTANCE_THRESHOLD,
-            anchorpoint_utils::storage::INSTANCE_EXTEND_TO,
-        );
+        anchorpoint_utils::storage::extend_instance_ttl(&env);
     }
 
     /// Withdraw an outstanding nomination (current super admin only).
@@ -120,6 +119,8 @@ impl SecurityRegistry {
             panic!("no pending admin");
         }
         env.storage().instance().remove(&DataKey::PendingAdmin);
+        env.events()
+            .publish((symbol_short!("adm_cxl"),), current_admin);
     }
 
     /// Returns the current super admin.
@@ -146,12 +147,10 @@ impl SecurityRegistry {
             panic!("not super admin");
         }
         env.storage().instance().set(&DataKey::IsPaused, &true);
+        env.events()
+            .publish((symbol_short!("pause"), admin), true);
 
-        anchorpoint_utils::storage::extend_instance_ttl(
-            &env,
-            anchorpoint_utils::storage::INSTANCE_THRESHOLD,
-            anchorpoint_utils::storage::INSTANCE_EXTEND_TO,
-        );
+        anchorpoint_utils::storage::extend_instance_ttl(&env);
     }
 
     pub fn unpause(env: Env, admin: Address) {
@@ -165,12 +164,10 @@ impl SecurityRegistry {
             panic!("not super admin");
         }
         env.storage().instance().set(&DataKey::IsPaused, &false);
+        env.events()
+            .publish((symbol_short!("unpause"), admin), false);
 
-        anchorpoint_utils::storage::extend_instance_ttl(
-            &env,
-            anchorpoint_utils::storage::INSTANCE_THRESHOLD,
-            anchorpoint_utils::storage::INSTANCE_EXTEND_TO,
-        );
+        anchorpoint_utils::storage::extend_instance_ttl(&env);
     }
 
     pub fn is_paused(env: Env) -> bool {
@@ -196,12 +193,10 @@ impl SecurityRegistry {
             panic!("not super admin");
         }
         env.storage().instance().set(&DataKey::PauseFlags, &flags);
+        env.events()
+            .publish((symbol_short!("p_flags"), admin), flags);
 
-        anchorpoint_utils::storage::extend_instance_ttl(
-            &env,
-            anchorpoint_utils::storage::INSTANCE_THRESHOLD,
-            anchorpoint_utils::storage::INSTANCE_EXTEND_TO,
-        );
+        anchorpoint_utils::storage::extend_instance_ttl(&env);
     }
 
     /// Returns the granular pause flags as configured by the admin.
@@ -247,7 +242,9 @@ impl SecurityRegistry {
         }
         env.storage()
             .persistent()
-            .set(&DataKey::ContractPaused(contract_id), &true);
+            .set(&DataKey::ContractPaused(contract_id.clone()), &true);
+        env.events()
+            .publish((symbol_short!("c_pause"),), (admin, contract_id));
     }
 
     /// Unpause a specific registered contract.
@@ -263,7 +260,9 @@ impl SecurityRegistry {
         }
         env.storage()
             .persistent()
-            .set(&DataKey::ContractPaused(contract_id), &false);
+            .set(&DataKey::ContractPaused(contract_id.clone()), &false);
+        env.events()
+            .publish((symbol_short!("c_unpause"),), (admin, contract_id));
     }
 
     /// Read-only query returning whether a specific contract is paused.
@@ -278,7 +277,10 @@ impl SecurityRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::{storage::Instance as _, Address as _};
+    use soroban_sdk::{
+        testutils::{storage::Instance as _, Address as _, Events},
+        vec as svec, IntoVal,
+    };
 
     // -------------------------------------------------------------------------
     // Two-step admin transfer
@@ -325,6 +327,29 @@ mod tests {
         client.propose_admin(&admin, &new_admin);
         client.accept_admin(&new_admin);
         client.pause(&admin);
+    }
+
+    #[test]
+    fn test_pause_emits_event() {
+        let env = Env::default();
+        let (admin, client) = setup_admin_transfer(&env);
+
+        client.pause(&admin);
+
+        let events = env.events().all();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events.get(1).unwrap(),
+            (
+                client.address.clone(),
+                svec![
+                    &env,
+                    soroban_sdk::symbol_short!("pause").into_val(&env),
+                    admin.into_val(&env),
+                ],
+                true.into_val(&env),
+            )
+        );
     }
 
     #[test]
@@ -426,7 +451,7 @@ mod tests {
         assert!(!client.is_paused());
 
         let initial_ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
-        assert!(initial_ttl >= anchorpoint_utils::storage::INSTANCE_EXTEND_TO);
+        assert!(initial_ttl >= anchorpoint_utils::storage::TTL_EXTENSION);
 
         env.mock_all_auths();
         client.pause(&admin);
@@ -436,13 +461,13 @@ mod tests {
         assert!(!client.is_paused());
 
         let pause_ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
-        assert!(pause_ttl >= anchorpoint_utils::storage::INSTANCE_EXTEND_TO);
+        assert!(pause_ttl >= anchorpoint_utils::storage::TTL_EXTENSION);
 
         client.unpause(&admin);
         assert!(!client.is_paused());
 
         let unpause_ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
-        assert!(unpause_ttl >= anchorpoint_utils::storage::INSTANCE_EXTEND_TO);
+        assert!(unpause_ttl >= anchorpoint_utils::storage::TTL_EXTENSION);
     }
 
     #[test]
@@ -619,7 +644,7 @@ mod tests {
         assert_eq!(auths[0].0, admin);
 
         let ttl = env.as_contract(&client.address, || env.storage().instance().get_ttl());
-        assert!(ttl >= anchorpoint_utils::storage::INSTANCE_EXTEND_TO);
+        assert!(ttl >= anchorpoint_utils::storage::TTL_EXTENSION);
     }
 
     #[test]

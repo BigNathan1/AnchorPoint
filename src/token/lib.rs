@@ -61,6 +61,10 @@ impl TokenContract {
         env.storage().instance().set(&DataKey::Decimals, &decimals);
         env.storage().instance().set(&DataKey::Name, &name);
         env.storage().instance().set(&DataKey::Symbol, &symbol);
+        env.events().publish(
+            (symbol_short!("tok_init"),),
+            (admin, decimals, name, symbol),
+        );
     }
 
     pub fn mint(env: Env, to: Address, token_id: u64, amount: i128) {

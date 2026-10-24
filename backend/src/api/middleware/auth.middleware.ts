@@ -3,6 +3,7 @@ import { config } from '../../config/env';
 import { extractBearerToken, verifyToken, MultiKeyVerifiedToken } from '../../services/auth.service';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { redis } from '../../lib/redis';
+import { horizonWebhookMiddleware } from './horizon-webhook.middleware';
 
 void config.JWT_SECRET;
 
@@ -212,6 +213,13 @@ export const requireRole = (...roles: AdminRole[]) => {
 };
 
 export const webhookSignatureMiddleware = (req: Request, res: Response, next: NextFunction) => {
+  const stellarSignature = req.headers['x-stellar-signature'] as string | undefined;
+  if (stellarSignature || process.env.HORIZON_WEBHOOK_SECRET || config.HORIZON_WEBHOOK_SECRET) {
+    if (stellarSignature || (!req.headers['x-anchorpoint-signature'] && (process.env.HORIZON_WEBHOOK_SECRET || config.HORIZON_WEBHOOK_SECRET))) {
+      return horizonWebhookMiddleware(req, res, next);
+    }
+  }
+
   const signature = req.headers['x-anchorpoint-signature'] as string | undefined;
   const timestamp = req.headers['x-anchorpoint-timestamp'] as string | undefined;
   const secret = config.WEBHOOK_SECRET;
@@ -220,9 +228,18 @@ export const webhookSignatureMiddleware = (req: Request, res: Response, next: Ne
     return res.status(401).json({ error: 'Missing webhook signature, timestamp, or secret' });
   }
 
-  const payload = JSON.stringify(req.body);
+  const requestTs = Number.isNaN(Number(timestamp))
+    ? Math.floor(Date.parse(timestamp) / 1000)
+    : parseInt(timestamp, 10);
+  if (Number.isNaN(requestTs) || Math.abs(Math.floor(Date.now() / 1000) - requestTs) > 300) {
+    return res.status(401).json({ error: 'Webhook timestamp outside acceptable 5-minute window' });
+  }
+
+  const rawBody =
+    (req as Request & { rawBody?: string }).rawBody ??
+    (typeof req.body === 'string' ? req.body : JSON.stringify(req.body));
   const expectedSignature = createHmac('sha256', secret)
-    .update(`${timestamp}.${payload}`)
+    .update(`${timestamp}.${rawBody}`)
     .digest('hex');
 
   const expectedBuffer = Buffer.from(`sha256=${expectedSignature}`);
