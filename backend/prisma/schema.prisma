@@ -305,6 +305,8 @@ model AdminConfigAuditLog {
   actorEmail      String? // Admin email / api-key label, when known
   actorIp         String?
   userAgent       String?
+  ipAddress       String? // Client IP address of the request
+  result          String   @default("success") // success | failure
   configVersion   Int? // Resulting config version after the change
   previousVersion Int? // Config version prior to the change
   changedKeys     String? // JSON array of changed top-level config keys
@@ -762,6 +764,8 @@ model AdminConfigAuditLog {
   actorEmail      String? // Admin email / api-key label, when known
   actorIp         String?
   userAgent       String?
+  ipAddress       String? // Client IP address of the request
+  result          String   @default("success") // success | failure
   configVersion   Int? // Resulting config version after the change
   previousVersion Int? // Config version prior to the change
   changedKeys     String? // JSON array of changed top-level config keys
