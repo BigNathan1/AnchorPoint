@@ -19,6 +19,7 @@ export class MetricsService {
   private kycVerificationTotal: Counter<string>;
   private transactionReconciliationTotal: Counter<string>;
   private sepFlowDuration: Histogram<string>;
+  private batchPaymentOperationsTotal: Counter<string>;
 
   constructor() {
     this.registry = new promClient.Registry();
@@ -170,6 +171,15 @@ export class MetricsService {
       buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
       registers: [this.registry],
     });
+
+    // #1521: Batch payment counters keyed by batch_id so each batch's metrics
+    // can be inspected independently. Avoids cumulative drift across batches.
+    this.batchPaymentOperationsTotal = new promClient.Counter({
+      name: 'anchor_batch_payment_operations_total',
+      help: 'Total number of payment operations processed per batch, labelled by batch_id, asset_code, and status',
+      labelNames: ['batch_id', 'asset_code', 'status'] as const,
+      registers: [this.registry],
+    });
   }
 
   /**
@@ -205,6 +215,16 @@ export class MetricsService {
    */
   observeSepFlowDuration(sep: string, operation: string, status: string, durationSeconds: number): void {
     this.sepFlowDuration.observe({ sep, operation, status }, durationSeconds);
+  }
+
+  /**
+   * #1521: Increment the per-batch payment operations counter.
+   *
+   * Using a batch_id label ensures that counters are scoped to the current
+   * batch and do not accumulate misleadingly across batches.
+   */
+  incrementBatchPaymentOperation(batchId: string, assetCode: string, status: string): void {
+    this.batchPaymentOperationsTotal.inc({ batch_id: batchId, asset_code: assetCode, status });
   }
 
   /**
