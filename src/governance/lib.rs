@@ -59,7 +59,7 @@ pub enum Error {
 
 /// Proposal lifecycle states
 #[contracttype]
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ProposalStatus {
     /// Proposal is open for voting
     OPEN,
@@ -514,12 +514,6 @@ impl GovernanceContract {
             "insufficient snapshot token balance"
         );
 
-        // Deduct credits from user
-        env.storage().instance().set(
-            &DataKey::VotingCredits(voter.clone()),
-            &(user_credits - quadratic_cost),
-        );
-
         // Update proposal vote totals
         if support {
             proposal.votes_for = proposal
@@ -558,6 +552,15 @@ impl GovernanceContract {
         env.storage().instance().set(
             &DataKey::UserQuadraticCost(proposal_id, voter.clone()),
             &quadratic_cost,
+        );
+
+        // Deduct the credits spent now that the vote is recorded
+        let remaining_credits = user_credits
+            .checked_sub(quadratic_cost)
+            .expect("credits underflow");
+        env.storage().instance().set(
+            &DataKey::VotingCredits(voter.clone()),
+            &remaining_credits,
         );
 
         // Update proposal with new vote totals
@@ -1126,6 +1129,51 @@ mod tests {
         );
         client.vote(&voter, &proposal_id, &true, &10i128);
         client.vote(&voter, &proposal_id, &true, &10i128);
+    }
+
+    #[test]
+    fn test_double_vote_rejected_without_spending_credits() {
+        let (env, admin, _) = setup();
+        let id = env.register(GovernanceContract, ());
+        let client = GovernanceContractClient::new(&env, &id);
+        let token_contract = env.register(MockToken, ());
+        client.initialize(&admin, &token_contract);
+
+        let creator = Address::generate(&env);
+        let voter = Address::generate(&env);
+        client.allocate_credits(&admin, &voter, &1000);
+
+        let proposal_id = client.create_proposal(
+            &creator,
+            &String::from_str(&env, "Test Proposal"),
+            &String::from_str(&env, "A proposal for testing"),
+            &86400u64,
+        );
+        client.vote(&voter, &proposal_id, &true, &10i128);
+        assert_eq!(client.get_credits(&voter), 900);
+
+        // Second attempt on the same proposal, in either direction, is rejected.
+        assert!(client
+            .try_vote(&voter, &proposal_id, &true, &5i128)
+            .is_err());
+        assert!(client
+            .try_vote(&voter, &proposal_id, &false, &1i128)
+            .is_err());
+
+        // Neither the credits nor the tally moved.
+        assert_eq!(client.get_credits(&voter), 900);
+        assert_eq!(client.get_proposal_votes(&proposal_id), (10, 0));
+        assert_eq!(client.get_voter_count(&proposal_id), 1);
+
+        // Credits keep decrementing across separate proposals.
+        let second_id = client.create_proposal(
+            &creator,
+            &String::from_str(&env, "Second Proposal"),
+            &String::from_str(&env, "Another proposal"),
+            &86400u64,
+        );
+        client.vote(&voter, &second_id, &false, &20i128);
+        assert_eq!(client.get_credits(&voter), 500);
     }
 
     #[test]

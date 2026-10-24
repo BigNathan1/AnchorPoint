@@ -75,10 +75,35 @@ export function generateTransactions(count: number = 10000): Transaction[] {
 
 export const INITIAL_TRANSACTIONS = generateTransactions(100);
 
+/** Matches Tailwind's `md` breakpoint: below it rows render as cards. */
+export const MOBILE_BREAKPOINT_QUERY = '(max-width: 767px)';
+
+const matchesMobile = (): boolean =>
+  typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+    ? window.matchMedia(MOBILE_BREAKPOINT_QUERY).matches
+    : false;
+
+const useIsMobileViewport = (): boolean => {
+  const [isMobile, setIsMobile] = useState(matchesMobile);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+    const mql = window.matchMedia(MOBILE_BREAKPOINT_QUERY);
+    const onChange = () => setIsMobile(mql.matches);
+    onChange();
+    mql.addEventListener?.('change', onChange);
+    return () => mql.removeEventListener?.('change', onChange);
+  }, []);
+
+  return isMobile;
+};
+
 interface TransactionHistoryProps {
   initialData?: Transaction[];
   totalInitialCount?: number;
   rowHeight?: number;
+  /** Estimated height of a collapsed mobile card; real heights are measured. */
+  mobileRowHeight?: number;
   overscan?: number;
 }
 
@@ -86,6 +111,7 @@ export const TransactionHistory: React.FC<TransactionHistoryProps> = ({
   initialData,
   totalInitialCount = 10000,
   rowHeight = 56,
+  mobileRowHeight = 112,
   overscan = 15
 }) => {
   const storeTransactions = useTransactionStore((state) => state.transactions);
@@ -127,6 +153,10 @@ export const TransactionHistory: React.FC<TransactionHistoryProps> = ({
   const [expandedTxIds, setExpandedTxIds] = useState<Set<string>>(new Set());
 
   const parentRef = useRef<HTMLDivElement>(null);
+  const isMobile = useIsMobileViewport();
+  // Cards are taller than table rows and grow when expanded, so rows are
+  // measured after render instead of being pinned to a fixed height.
+  const estimatedRowHeight = isMobile ? mobileRowHeight : rowHeight;
 
   const toggleExpand = (id: string) => {
     setExpandedTxIds(prev => {
@@ -162,9 +192,13 @@ export const TransactionHistory: React.FC<TransactionHistoryProps> = ({
   const rowVirtualizer = useVirtualizer({
     count: filteredTransactions.length,
     getScrollElement: () => parentRef.current,
-    estimateSize: () => rowHeight,
+    estimateSize: () => estimatedRowHeight,
     overscan
   });
+
+  useEffect(() => {
+    rowVirtualizer.measure();
+  }, [estimatedRowHeight, rowVirtualizer]);
 
   const virtualRows = rowVirtualizer.getVirtualItems();
   const itemsToRender = virtualRows.length > 0
@@ -178,8 +212,8 @@ export const TransactionHistory: React.FC<TransactionHistoryProps> = ({
     : filteredTransactions.slice(0, overscan).map((tx, idx) => ({
         index: idx,
         key: tx.id,
-        start: idx * rowHeight,
-        size: rowHeight,
+        start: idx * estimatedRowHeight,
+        size: estimatedRowHeight,
         tx
       }));
 
@@ -333,7 +367,7 @@ export const TransactionHistory: React.FC<TransactionHistoryProps> = ({
         <div
           ref={parentRef}
           data-testid="virtual-scroll-container"
-          className="overflow-y-auto max-h-[560px] relative scrollbar-thin scrollbar-thumb-slate-700"
+          className="overflow-y-auto overflow-x-hidden max-h-[560px] relative scrollbar-thin scrollbar-thumb-slate-700"
           style={{ height: '560px', contain: 'strict' }}
         >
           {filteredTransactions.length === 0 ? (
@@ -358,6 +392,7 @@ export const TransactionHistory: React.FC<TransactionHistoryProps> = ({
                 return (
                   <div
                     key={item.key}
+                    ref={rowVirtualizer.measureElement}
                     data-index={item.index}
                     data-testid={`tx-row-${item.index}`}
                     data-animating={isRecentlyUpdated ? 'true' : undefined}
