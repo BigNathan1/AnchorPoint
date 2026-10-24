@@ -100,3 +100,96 @@ describe('GET /auth challenge generation', () => {
     expect(response.body).toEqual({ error: 'account parameter is required' });
   });
 });
+
+describe('JWT refresh token rotation routes (POST /sep10/auth & POST /auth/refresh)', () => {
+  const TEST_SIGNER = 'GSIGNER1XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX';
+
+  const createRotationApp = () => {
+    const app = express();
+    app.use(express.json());
+    app.use('/sep10', authRouter);
+    app.use('/auth', authRouter);
+    return app;
+  };
+
+  it('POST /sep10/auth returns access_token (15 min TTL) and refresh_token (7 day TTL)', async () => {
+    const app = createRotationApp();
+
+    // 1. Generate a challenge
+    await request(app)
+      .post('/sep10')
+      .send({
+        account: TEST_SIGNER,
+        multiKey: true,
+        threshold: 'low',
+        signers: [{ publicKey: TEST_SIGNER, weight: 1, signed: false }],
+      });
+
+    // Wait or use stored challenge via authService
+    const { redisService } = require('./auth.route');
+    const { storeChallenge } = require('../../services/auth.service');
+    await storeChallenge(redisService, TEST_SIGNER, 'signed-challenge-xdr');
+
+    // 2. Exchange challenge for tokens via POST /sep10/auth
+    const authRes = await request(app)
+      .post('/sep10/auth')
+      .send({
+        transaction: 'signed-challenge-xdr',
+        threshold: 'low',
+        signatures: [{ publicKey: TEST_SIGNER, signature: 'sig-1', weight: 1 }],
+      });
+
+    expect(authRes.status).toBe(200);
+    expect(authRes.body.access_token).toBeDefined();
+    expect(authRes.body.refresh_token).toBeDefined();
+    expect(authRes.body.expires_in).toBe(900); // 15 min TTL
+    expect(authRes.body.refresh_expires_in).toBe(604800); // 7 day TTL
+  });
+
+  it('POST /auth/refresh rotates refresh token and invalidates old token; reuse invalidates session family', async () => {
+    const app = createRotationApp();
+    const { redisService } = require('./auth.route');
+    const { storeChallenge } = require('../../services/auth.service');
+
+    await storeChallenge(redisService, TEST_SIGNER, 'challenge-for-rotation');
+
+    const authRes = await request(app)
+      .post('/sep10/auth')
+      .send({
+        transaction: 'challenge-for-rotation',
+        threshold: 'low',
+        signatures: [{ publicKey: TEST_SIGNER, signature: 'sig-1', weight: 1 }],
+      });
+
+    expect(authRes.status).toBe(200);
+    const { refresh_token: refreshToken1 } = authRes.body;
+
+    // Rotate refresh token 1 -> get pair 2
+    const refreshRes1 = await request(app)
+      .post('/auth/refresh')
+      .send({ refresh_token: refreshToken1 });
+
+    expect(refreshRes1.status).toBe(200);
+    expect(refreshRes1.body.access_token).toBeDefined();
+    expect(refreshRes1.body.refresh_token).toBeDefined();
+    expect(refreshRes1.body.refresh_token).not.toBe(refreshToken1);
+    expect(refreshRes1.body.expires_in).toBe(900);
+
+    const refreshToken2 = refreshRes1.body.refresh_token;
+
+    // Reusing old refreshToken1 triggers security alert and invalidates the entire session family
+    const reuseRes = await request(app)
+      .post('/auth/refresh')
+      .send({ refresh_token: refreshToken1 });
+
+    expect(reuseRes.status).toBe(401);
+    expect(reuseRes.body.code).toBe('REFRESH_TOKEN_REUSE');
+
+    // Now even the latest refreshToken2 in the family is invalidated
+    const familyInvalidatedRes = await request(app)
+      .post('/auth/refresh')
+      .send({ refresh_token: refreshToken2 });
+
+    expect(familyInvalidatedRes.status).toBe(401);
+  });
+});

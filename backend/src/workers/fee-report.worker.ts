@@ -71,6 +71,5 @@ if (require.main === module) {
   logger.info('Fee report worker process started');
   setupWorkerGracefulShutdown(feeReportWorker, {
     workerName: 'Fee report worker',
-    timeoutMs: 15000,
   });
 }

@@ -1,10 +1,11 @@
-import { Horizon, rpc, TransactionBuilder, Account, Networks, Memo, Operation, Keypair, Transaction, FeeBumpTransaction, Asset, Claimant, xdr } from '@stellar/stellar-sdk';
+import { Horizon, rpc, TransactionBuilder, Account, Networks, Memo, Operation, Keypair, Transaction, FeeBumpTransaction, Asset, Claimant, xdr, StrKey } from '@stellar/stellar-sdk';
 import { NetworkType, NETWORKS } from '../config/networks';
 import { config } from '../config/env';
 import { SignerInfo, SignatureInfo } from './auth.service';
 import configService from './config.service';
 import logger from '../utils/logger';
 import prisma from '../lib/prisma';
+import { traceAsync, SpanKind } from '../utils/tracing';
 
 export interface AccountSigners {
   signers: Array<{
@@ -83,7 +84,36 @@ export class StellarService {
     throw lastError;
   }
 
+  /**
+   * Wraps a Soroban RPC call in a child span with `rpc.method`, `contract.id`
+   * and `ledger.sequence` attributes. Errors mark the span as ERROR.
+   */
+  private traceRpcCall<T>(method: string, args: any[], fn: () => Promise<T>): Promise<T> {
+    return traceAsync(
+      `soroban.rpc.${method}`,
+      async (span) => {
+        span.setAttribute('rpc.method', method);
+        const target = args[0];
+        const contractId = typeof target?.contractId === 'function' ? target.contractId() : target;
+        if (typeof contractId === 'string' && StrKey.isValidContract(contractId)) {
+          span.setAttribute('contract.id', contractId);
+        }
+        const result: any = await fn();
+        const ledgerSequence = result?.sequence ?? result?.latestLedger;
+        if (typeof ledgerSequence === 'number') {
+          span.setAttribute('ledger.sequence', ledgerSequence);
+        }
+        return result;
+      },
+      SpanKind.CLIENT
+    );
+  }
+
   private async executeRpcWithFailover<T>(method: string, ...args: any[]): Promise<T> {
+    return this.traceRpcCall(method, args, () => this.executeRpcWithFailoverUntraced<T>(method, ...args));
+  }
+
+  private async executeRpcWithFailoverUntraced<T>(method: string, ...args: any[]): Promise<T> {
     const errors: Error[] = [];
     for (let i = 0; i < this.rpcUrls.length; i++) {
       const index = i;
@@ -150,11 +180,12 @@ export class StellarService {
     const fallbackUrls = this.rpcUrls.slice(1);
     const allUrls = [primaryUrl, ...fallbackUrls];
     const primaryServer = new rpc.Server(primaryUrl);
+    const traceRpcCall = this.traceRpcCall.bind(this);
     return new Proxy(primaryServer, {
       get(target: rpc.Server, prop: string, receiver: any) {
         const value = Reflect.get(target, prop, receiver);
         if (typeof value === 'function' && prop !== 'constructor') {
-          return async (...args: any[]) => {
+          return async (...args: any[]) => traceRpcCall(prop, args, async () => {
             const errors: Error[] = [];
             for (let i = 0; i < allUrls.length; i++) {
               const server = new rpc.Server(allUrls[i]);
@@ -178,7 +209,7 @@ export class StellarService {
               }
             }
             throw errors[errors.length - 1] || new Error('All RPC servers failed');
-          };
+          });
         }
         return value;
       },
@@ -590,7 +621,7 @@ export class StellarService {
     try {
       const sorobanRpc = this.getSorobanRpc();
       // Attempt to get the latest ledger as a connectivity check
-      await sorobanRpc.getLatestLedger();
+      await this.traceRpcCall('getLatestLedger', [], () => sorobanRpc.getLatestLedger());
       return { status: 'UP' };
     } catch (error) {
       logger.error('Soroban RPC health check failed:', error);

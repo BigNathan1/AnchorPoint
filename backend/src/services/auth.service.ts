@@ -1,9 +1,10 @@
 import jwt from 'jsonwebtoken';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 
 import { RedisService } from './redis.service';
 import { redis } from '../lib/redis';
 import { revokeToken as blacklistToken, isTokenRevoked } from './jwt-blacklist.service';
+import logger from '../utils/logger';
 
 import { traceAsync, traceSync, SpanKind } from '../utils/tracing';
 import configService from './config.service';
@@ -62,10 +63,56 @@ export interface MultiKeyVerifiedToken {
   transactionXdr?: string; // For hardware wallet support
 }
 
+export interface RefreshTokenRecord {
+  familyId: string;
+  publicKey: string;
+  multiKeyData?: MultiKeyVerifiedToken;
+  status: 'active' | 'rotated';
+  createdAt: number;
+  expiresAt: number;
+}
+
+export interface SessionFamilyRecord {
+  familyId: string;
+  publicKey: string;
+  tokenHashes: string[];
+  revoked: boolean;
+  createdAt: number;
+  revokedAt?: number;
+}
+
+export interface TokenPair {
+  access_token: string;
+  refresh_token: string;
+  expires_in: number;
+  refresh_expires_in: number;
+  familyId: string;
+}
+
+export const ACCESS_TOKEN_TTL_SECONDS = 15 * 60; // 15 minutes (900 seconds)
+export const REFRESH_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days (604800 seconds)
+
 const CHALLENGE_TTL_SECONDS = 300; // 5 minutes
 const DEFAULT_REVOCATION_TTL_SECONDS = 3600; // fallback when token has no exp claim
-const JWT_SECRET = configService.getConfig().JWT_SECRET;
+const REFRESH_TOKEN_PREFIX = 'auth:refresh:';
+const REFRESH_FAMILY_PREFIX = 'auth:refresh_family:';
 const defaultRedisService = new RedisService(redis as any);
+
+export class RefreshTokenReuseError extends Error {
+  public readonly familyId: string;
+  public readonly publicKey: string;
+
+  constructor(familyId: string, publicKey: string, message = 'Refresh token reuse detected; session family invalidated') {
+    super(message);
+    this.name = 'RefreshTokenReuseError';
+    this.familyId = familyId;
+    this.publicKey = publicKey;
+  }
+}
+
+export const hashRefreshToken = (token: string): string => {
+  return createHash('sha256').update(token).digest('hex');
+};
 
 export const extractBearerToken = (authorization?: string): string | null => {
   if (!authorization?.startsWith('Bearer ')) return null;
@@ -73,7 +120,11 @@ export const extractBearerToken = (authorization?: string): string | null => {
   return token || null;
 };
 
-export const signToken = (publicKey: string, multiKeyData?: MultiKeyVerifiedToken): string => {
+export const signToken = (
+  publicKey: string,
+  multiKeyData?: MultiKeyVerifiedToken,
+  expiresInSeconds?: number
+): string => {
   return traceSync(
     'auth.sign_token',
     (span) => {
@@ -86,10 +137,21 @@ export const signToken = (publicKey: string, multiKeyData?: MultiKeyVerifiedToke
         threshold: multiKeyData.threshold, 
         authLevel: multiKeyData.authLevel 
       } : { sub: publicKey };
-      return jwt.sign(payload, configService.getConfig().JWT_SECRET);
+      const secret = configService.getConfig().JWT_SECRET;
+      if (typeof expiresInSeconds === 'number') {
+        return jwt.sign(payload, secret, { expiresIn: expiresInSeconds });
+      }
+      return jwt.sign(payload, secret);
     },
     SpanKind.INTERNAL
   );
+};
+
+export const signAccessToken = (
+  publicKey: string,
+  multiKeyData?: MultiKeyVerifiedToken
+): string => {
+  return signToken(publicKey, multiKeyData, ACCESS_TOKEN_TTL_SECONDS);
 };
 
 export const verifyToken = async (
@@ -116,6 +178,201 @@ export const verifyToken = async (
       return { sub: decoded.sub };
     },
     SpanKind.INTERNAL
+  );
+};
+
+export const generateRefreshTokenValue = (): string => {
+  return randomBytes(32).toString('hex');
+};
+
+/**
+ * Invalidates an entire refresh token session family in Redis.
+ */
+export const invalidateSessionFamily = async (
+  redisService: RedisService,
+  familyId: string
+): Promise<void> => {
+  return traceAsync(
+    'auth.invalidate_session_family',
+    async (span) => {
+      span.setAttribute('auth.family_id', familyId);
+      const familyKey = `${REFRESH_FAMILY_PREFIX}${familyId}`;
+      const family = await redisService.getJSON<SessionFamilyRecord>(familyKey);
+
+      if (family && Array.isArray(family.tokenHashes)) {
+        for (const tokenHash of family.tokenHashes) {
+          await redisService.del(`${REFRESH_TOKEN_PREFIX}${tokenHash}`);
+        }
+        await redisService.setJSON<SessionFamilyRecord>(
+          familyKey,
+          {
+            ...family,
+            tokenHashes: [],
+            revoked: true,
+            revokedAt: Date.now(),
+          },
+          REFRESH_TOKEN_TTL_SECONDS
+        );
+      } else {
+        await redisService.del(familyKey);
+      }
+    },
+    SpanKind.CLIENT
+  );
+};
+
+/**
+ * Issues a new access_token (15 min TTL) and refresh_token (7 day TTL) pair,
+ * storing the hashed refresh token and session family metadata in Redis.
+ */
+export const issueTokenPair = async (
+  publicKey: string,
+  redisService: RedisService = defaultRedisService,
+  multiKeyData?: MultiKeyVerifiedToken,
+  existingFamilyId?: string
+): Promise<TokenPair> => {
+  return traceAsync(
+    'auth.issue_token_pair',
+    async (span) => {
+      span.setAttribute('auth.public_key', publicKey);
+
+      const familyId =
+        existingFamilyId ||
+        (typeof randomUUID === 'function' ? randomUUID() : randomBytes(16).toString('hex'));
+      span.setAttribute('auth.family_id', familyId);
+
+      const accessToken = signAccessToken(publicKey, multiKeyData);
+      const refreshToken = generateRefreshTokenValue();
+      const tokenHash = hashRefreshToken(refreshToken);
+      const now = Date.now();
+
+      const tokenRecord: RefreshTokenRecord = {
+        familyId,
+        publicKey,
+        multiKeyData,
+        status: 'active',
+        createdAt: now,
+        expiresAt: now + REFRESH_TOKEN_TTL_SECONDS * 1000,
+      };
+
+      const tokenKey = `${REFRESH_TOKEN_PREFIX}${tokenHash}`;
+      await redisService.setJSON(tokenKey, tokenRecord, REFRESH_TOKEN_TTL_SECONDS);
+
+      const familyKey = `${REFRESH_FAMILY_PREFIX}${familyId}`;
+      const existingFamily = existingFamilyId
+        ? await redisService.getJSON<SessionFamilyRecord>(familyKey)
+        : null;
+
+      const familyRecord: SessionFamilyRecord = {
+        familyId,
+        publicKey,
+        tokenHashes: existingFamily
+          ? [...existingFamily.tokenHashes, tokenHash]
+          : [tokenHash],
+        revoked: false,
+        createdAt: existingFamily ? existingFamily.createdAt : now,
+      };
+
+      await redisService.setJSON(familyKey, familyRecord, REFRESH_TOKEN_TTL_SECONDS);
+
+      return {
+        access_token: accessToken,
+        refresh_token: refreshToken,
+        expires_in: ACCESS_TOKEN_TTL_SECONDS,
+        refresh_expires_in: REFRESH_TOKEN_TTL_SECONDS,
+        familyId,
+      };
+    },
+    SpanKind.CLIENT
+  );
+};
+
+/**
+ * Rotates a refresh token:
+ * - Validates the refresh token hash in Redis.
+ * - Marks the old token as 'rotated' (invalidated).
+ * - If a rotated token is reused, logs a security alert and invalidates the entire session family.
+ * - Issues and returns a new access/refresh token pair in the same session family.
+ */
+export const rotateRefreshToken = async (
+  refreshToken: string,
+  redisService: RedisService = defaultRedisService
+): Promise<TokenPair & { multiKeyData?: MultiKeyVerifiedToken; publicKey: string }> => {
+  return traceAsync(
+    'auth.rotate_refresh_token',
+    async (span) => {
+      if (!refreshToken || typeof refreshToken !== 'string') {
+        throw new Error('Invalid or expired refresh token');
+      }
+
+      const tokenHash = hashRefreshToken(refreshToken);
+      const tokenKey = `${REFRESH_TOKEN_PREFIX}${tokenHash}`;
+      const record = await redisService.getJSON<RefreshTokenRecord>(tokenKey);
+
+      if (!record) {
+        span.setAttribute('auth.refresh_valid', false);
+        throw new Error('Invalid or expired refresh token');
+      }
+
+      span.setAttribute('auth.family_id', record.familyId);
+      span.setAttribute('auth.public_key', record.publicKey);
+
+      const familyKey = `${REFRESH_FAMILY_PREFIX}${record.familyId}`;
+      const family = await redisService.getJSON<SessionFamilyRecord>(familyKey);
+
+      if (family?.revoked) {
+        span.setAttribute('auth.family_revoked', true);
+        throw new Error('Session family has been invalidated');
+      }
+
+      // Reuse detection: token was already rotated
+      if (record.status === 'rotated') {
+        span.setAttribute('auth.refresh_reuse_detected', true);
+        logger.error('SECURITY ALERT: Refresh token reuse detected. Invalidating session family.', {
+          alertType: 'REFRESH_TOKEN_REUSE',
+          severity: 'critical',
+          familyId: record.familyId,
+          publicKey: record.publicKey,
+        });
+
+        await invalidateSessionFamily(redisService, record.familyId);
+        throw new RefreshTokenReuseError(record.familyId, record.publicKey);
+      }
+
+      if (record.expiresAt && Date.now() > record.expiresAt) {
+        await redisService.del(tokenKey);
+        throw new Error('Refresh token has expired');
+      }
+
+      // Mark old token as rotated (keep in Redis for remaining TTL to detect reuse)
+      const remainingTtl = record.expiresAt
+        ? Math.max(Math.floor((record.expiresAt - Date.now()) / 1000), 1)
+        : REFRESH_TOKEN_TTL_SECONDS;
+
+      await redisService.setJSON<RefreshTokenRecord>(
+        tokenKey,
+        {
+          ...record,
+          status: 'rotated',
+        },
+        remainingTtl
+      );
+
+      // Issue new pair within the same session family
+      const newPair = await issueTokenPair(
+        record.publicKey,
+        redisService,
+        record.multiKeyData,
+        record.familyId
+      );
+
+      return {
+        ...newPair,
+        publicKey: record.publicKey,
+        multiKeyData: record.multiKeyData,
+      };
+    },
+    SpanKind.CLIENT
   );
 };
 

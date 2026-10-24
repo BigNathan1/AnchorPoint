@@ -96,6 +96,10 @@ impl BridgeStub {
         env.storage()
             .instance()
             .set(&DataKey::RelayerKey, &relayer_key);
+        env.events().publish(
+            (symbol_short!("br_init"),),
+            (admin, bridge_token, relayer, relayer_key),
+        );
     }
 
     /// Burns tokens on this chain to be moved to another chain.

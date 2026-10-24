@@ -1,13 +1,21 @@
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { validate } from '../middleware/validate.middleware';
+import { requireRole } from '../middleware/auth.middleware';
 import {
   switchNetworkSchema,
   patchTransactionSchema,
   passwordResetRequestSchema,
   passwordResetConfirmSchema,
   purgeCacheSchema,
+  adminMfaConfirmSchema,
+  adminLoginSchema,
 } from './admin.schemas';
+import {
+  setupAdminMfa,
+  confirmAdminMfa,
+  loginAdmin,
+} from '../controllers/admin.controller';
 import { stellarService } from '../../services/stellar.service';
 import { NetworkType } from '../../config/networks';
 import { SEP31Service } from '../../services/sep31.service';
@@ -30,6 +38,95 @@ const adminPasswordResetService = new AdminPasswordResetService();
 // Singleton service instance
 const sep31Service = new SEP31Service(createCallbackNotifier());
 
+// Admin RBAC: read endpoints accept every role, destructive ones need SUPER_ADMIN or OPS
+const requireReadAccess = requireRole('SUPER_ADMIN', 'OPS', 'READ_ONLY');
+const requireWriteAccess = requireRole('SUPER_ADMIN', 'OPS');
+
+/**
+ * @swagger
+ * /api/admin/login:
+ *   post:
+ *     summary: Authenticate an admin user
+ *     description: Logs in an admin with email and password. Requires a TOTP code (or single-use backup code) when MFA is enabled.
+ *     tags: [Admin]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - email
+ *               - password
+ *             properties:
+ *               email:
+ *                 type: string
+ *                 format: email
+ *               password:
+ *                 type: string
+ *               totpCode:
+ *                 type: string
+ *                 description: 6-digit TOTP code or single-use backup code when MFA is enabled
+ *               code:
+ *                 type: string
+ *                 description: Alias for totpCode
+ *     responses:
+ *       200:
+ *         description: Admin authenticated successfully
+ *       400:
+ *         description: Invalid request payload
+ *       401:
+ *         description: Invalid credentials, MFA required, or invalid TOTP code
+ */
+router.post('/login', validate({ body: adminLoginSchema }), loginAdmin);
+
+/**
+ * @swagger
+ * /api/admin/mfa/setup:
+ *   post:
+ *     summary: Initialize TOTP MFA setup for the authenticated admin
+ *     description: Generates a Base32 TOTP secret, QR code data URL, and 10 single-use backup codes.
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: TOTP secret, QR code, and backup codes generated
+ *       401:
+ *         description: Authentication required
+ */
+router.post('/mfa/setup', requireReadAccess, setupAdminMfa);
+
+/**
+ * @swagger
+ * /api/admin/mfa/confirm:
+ *   post:
+ *     summary: Verify first TOTP code and enable MFA for the authenticated admin
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - code
+ *             properties:
+ *               code:
+ *                 type: string
+ *                 description: 6-digit TOTP code from authenticator app
+ *     responses:
+ *       200:
+ *         description: MFA verified and enabled
+ *       400:
+ *         description: Invalid or expired TOTP code
+ *       401:
+ *         description: Authentication required
+ */
+router.post('/mfa/confirm', requireReadAccess, validate({ body: adminMfaConfirmSchema }), confirmAdminMfa);
+
 /**
  * @swagger
  * /admin/network:
@@ -48,7 +145,7 @@ const sep31Service = new SEP31Service(createCallbackNotifier());
  *                   type: string
  *                   example: TESTNET
  */
-router.get('/network', (req: Request, res: Response) => {
+router.get('/network', requireReadAccess, (req: Request, res: Response) => {
   res.json({ network: stellarService.getNetwork() });
 });
 
@@ -76,7 +173,7 @@ router.get('/network', (req: Request, res: Response) => {
  *       400:
  *         description: Invalid network type
  */
-router.post('/network', validate({ body: switchNetworkSchema }), async (req: Request, res: Response) => {
+router.post('/network', requireWriteAccess, validate({ body: switchNetworkSchema }), async (req: Request, res: Response) => {
   const { network } = req.body;
 
   try {
@@ -137,7 +234,7 @@ router.post('/network', validate({ body: switchNetworkSchema }), async (req: Req
  *       200:
  *         description: Transaction status updated successfully
  */
-router.patch('/transactions/:id', validate({ body: patchTransactionSchema }), async (req: Request, res: Response) => {
+router.patch('/transactions/:id', requireWriteAccess, validate({ body: patchTransactionSchema }), async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const { status, stellar_transaction_id, external_transaction_id, amount_out, amount_fee } = req.body;
@@ -316,7 +413,7 @@ const adminTransactionsQuerySchema = z.object({
  *       500:
  *         description: Internal server error
  */
-router.get('/transactions', async (req: Request, res: Response) => {
+router.get('/transactions', requireReadAccess, async (req: Request, res: Response) => {
   const parsed = adminTransactionsQuerySchema.safeParse(req.query);
   if (!parsed.success) {
     return res.status(400).json({
@@ -391,7 +488,7 @@ const purgeTomlCacheSchema = z.object({
  *                   type: integer
  *                   description: Number of cache entries removed
  */
-router.post('/cache/purge-toml', validate({ body: purgeCacheSchema }), async (req: Request, res: Response) => {
+router.post('/cache/purge-toml', requireWriteAccess, validate({ body: purgeCacheSchema }), async (req: Request, res: Response) => {
   const parsed = purgeTomlCacheSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({
@@ -476,7 +573,7 @@ const auditLogsQuerySchema = z.object({
  *       400:
  *         description: Invalid query parameters
  */
-router.get(['/audit-log', '/audit-logs'], async (req: Request, res: Response) => {
+router.get(['/audit-log', '/audit-logs'], requireReadAccess, async (req: Request, res: Response) => {
   const parsed = auditLogsQuerySchema.safeParse(req.query);
   if (!parsed.success) {
     return res.status(400).json({
@@ -559,7 +656,7 @@ const dlqListQuerySchema = z.object({
   end: z.coerce.number().int().min(0).default(49),
 });
 
-router.get('/queues/notification-dlq', async (req: Request, res: Response) => {
+router.get('/queues/notification-dlq', requireReadAccess, async (req: Request, res: Response) => {
   const parsed = dlqListQuerySchema.safeParse(req.query);
   if (!parsed.success) {
     return res.status(400).json({
@@ -609,7 +706,7 @@ router.get('/queues/notification-dlq', async (req: Request, res: Response) => {
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.post('/queues/notification-dlq/:jobId/retry', async (req: Request, res: Response) => {
+router.post('/queues/notification-dlq/:jobId/retry', requireWriteAccess, async (req: Request, res: Response) => {
   try {
     const retried = await retryNotificationDlqJob(req.params.jobId);
     if (!retried) {

@@ -49,6 +49,14 @@ describe('Backend API', () => {
     expect(typeof res.body.services.redis.latencyMs).toBe('number');
   });
 
+  it('should report KMS and KYC provider status on health check', async () => {
+    const res = await request(app).get('/health');
+    expect(res.body.services.kms).toEqual('NOT_CONFIGURED');
+    expect(res.body.services.kycProvider).toEqual('UP');
+    expect(res.body.services).toHaveProperty('horizon');
+    expect(res.body.services).toHaveProperty('sorobanRpc');
+  });
+
   it('should return DOWN on health check when database is down', async () => {
     (prisma.$queryRaw as jest.Mock).mockRejectedValue(new Error('DB Connection Refused'));
 

@@ -4,6 +4,7 @@ import { LogoMark } from './LogoMark';
 import { MetricsChart } from './MetricsChart';
 import { DashboardOverviewSkeleton } from './Skeletons';
 import { StakingCalculator } from './StakingCalculator';
+import { StakingDashboard } from './StakingDashboard';
 import { TransactionStatusBadge, type TransactionStatus } from './TransactionStatusBadge';
 import type { UiConfig } from '../types';
 
@@ -262,6 +263,9 @@ export const DashboardOverview = ({ uiConfig, isLoading = false }: DashboardOver
                 </div>
               </div>
             </div>
+          </div>
+          <div className="glass-card p-6">
+            <StakingDashboard />
           </div>
           <div className="glass-card p-6">
             <StakingCalculator />

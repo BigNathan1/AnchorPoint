@@ -1,6 +1,7 @@
 import { Worker, Job } from 'bullmq';
 import { QUEUE_NAMES, defaultWorkerOptions, workerConcurrencyConfig } from '../config/queue';
 import logger from '../utils/logger';
+import { setupWorkerGracefulShutdown } from './graceful-shutdown';
 
 export interface WebhookJobData {
   url: string;
@@ -45,3 +46,11 @@ export class WebhookQueueWorker {
 }
 
 export const defaultWebhookQueueWorker = new WebhookQueueWorker();
+
+// If executed directly as worker process
+if (require.main === module) {
+  logger.info('Webhook queue worker process started');
+  setupWorkerGracefulShutdown(defaultWebhookQueueWorker.start(), {
+    workerName: 'Webhook queue worker',
+  });
+}

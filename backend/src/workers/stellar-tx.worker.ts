@@ -1,6 +1,7 @@
 import { Worker, Job } from 'bullmq';
 import { QUEUE_NAMES, defaultWorkerOptions, workerConcurrencyConfig } from '../config/queue';
 import logger from '../utils/logger';
+import { setupWorkerGracefulShutdown } from './graceful-shutdown';
 
 export interface StellarTxJobData {
   transactionXdr: string;
@@ -46,3 +47,11 @@ export class StellarTxWorker {
 }
 
 export const defaultStellarTxWorker = new StellarTxWorker();
+
+// If executed directly as worker process
+if (require.main === module) {
+  logger.info('Stellar tx worker process started');
+  setupWorkerGracefulShutdown(defaultStellarTxWorker.start(), {
+    workerName: 'Stellar tx worker',
+  });
+}

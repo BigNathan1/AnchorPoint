@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { authMiddleware } from '../middleware/auth.middleware';
 import { validate } from '../middleware/validate.middleware';
+import { sepFlowMetricsMiddleware } from '../middleware/sep-flow-metrics.middleware';
 import {
   sep6Info,
   sep6Deposit,
@@ -11,6 +12,8 @@ import {
 } from '../controllers/sep6.controller';
 
 const router = Router();
+
+router.use(sepFlowMetricsMiddleware('sep6'));
 
 const depositQuerySchema = z
   .object({

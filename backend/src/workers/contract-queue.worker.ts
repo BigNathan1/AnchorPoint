@@ -441,10 +441,9 @@ function startWorker() {
   logger.info(`   Queue: ${QUEUE_NAMES.CONTRACT_INTERACTIONS}`);
   logger.info(`   Concurrency: ${defaultWorkerOptions.concurrency}`);
 
-  // Graceful shutdown with 15-second grace window
+  // Graceful shutdown within the WORKER_SHUTDOWN_TIMEOUT_MS grace window
   setupWorkerGracefulShutdown(worker, {
     workerName: 'Contract queue worker',
-    timeoutMs: 15000,
     onShutdown: async () => {
       try {
         await dlq.close();

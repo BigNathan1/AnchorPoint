@@ -84,6 +84,16 @@ jest.mock('../lib/redis', () => ({
     incr: jest.fn().mockResolvedValue(1),
     expire: jest.fn().mockResolvedValue(1),
   },
+  // #1525: provide a redlock stub so SequenceNumberManager can acquire/release
+  // distributed locks without a real Redis connection during unit tests.
+  redlock: {
+    acquire: jest.fn().mockResolvedValue({
+      resources: ['stellar:seq:lock:mock'],
+      value: 'mock-lock-value',
+      release: jest.fn().mockResolvedValue(undefined),
+    }),
+    release: jest.fn().mockResolvedValue(undefined),
+  },
 }));
 
 // Mock logger
@@ -92,6 +102,13 @@ jest.mock('../utils/logger', () => ({
   error: jest.fn(),
   warn: jest.fn(),
   debug: jest.fn(),
+}));
+
+// Mock metrics service so batch-payment counter calls are no-ops in tests.
+jest.mock('./metrics.service', () => ({
+  metricsService: {
+    incrementBatchPaymentOperation: jest.fn(),
+  },
 }));
 
 describe('BatchPaymentService', () => {
@@ -345,6 +362,71 @@ describe('BatchPaymentService', () => {
           sourceSecretKey: mockSecretKey,
         })
       ).rejects.toThrow('Batch payment failed after 2 attempts');
+    });
+  });
+
+  describe('executeBatch dry run', () => {
+    const mockDryRunAccount = (xlmBalance: string) => {
+      const mockServerInstance = getMockServerInstance() as {
+        submitTransaction: jest.Mock;
+        loadAccount?: jest.Mock;
+      };
+      mockServerInstance.submitTransaction = jest.fn();
+      mockServerInstance.loadAccount = jest.fn().mockResolvedValue({
+        sequenceNumber: () => '123456789012345678',
+        balances: [{ asset_type: 'native', balance: xlmBalance }],
+      });
+      return mockServerInstance;
+    };
+
+    it('should validate and estimate fees without submitting a transaction', async () => {
+      const server = mockDryRunAccount('100.0000000');
+
+      const result = await batchService.executeBatch({
+        payments: mockPayments,
+        sourceSecretKey: mockSecretKey,
+        dryRun: true,
+      });
+
+      expect(server.submitTransaction).not.toHaveBeenCalled();
+      expect(result.dry_run).toBe(true);
+      expect(result.transactionHash).toBeNull();
+      expect(result.totalOps).toBe(2);
+      expect(result.successfulOps).toBe(2);
+      expect(result.estimatedFee).toBe(200);
+      expect(result.recipients.every((r) => r.valid)).toBe(true);
+      expect(result.totalCost).toEqual([
+        { assetCode: 'XLM', required: '30.5000200', available: '100.0000000', sufficient: true },
+      ]);
+      expect(result.valid).toBe(true);
+    });
+
+    it('should report invalid recipients instead of throwing', async () => {
+      mockDryRunAccount('100.0000000');
+
+      const result = await batchService.executeBatch({
+        payments: [...mockPayments, { destination: 'invalid', amount: '5' }],
+        sourceSecretKey: mockSecretKey,
+        dryRun: true,
+      });
+
+      expect(result.recipients[2]).toMatchObject({ index: 2, valid: false });
+      expect(result.recipients[2].error).toContain('Invalid destination');
+      expect(result.successfulOps).toBe(2);
+      expect(result.valid).toBe(false);
+    });
+
+    it('should flag insufficient balance', async () => {
+      mockDryRunAccount('10.0000000');
+
+      const result = await batchService.executeBatch({
+        payments: mockPayments,
+        sourceSecretKey: mockSecretKey,
+        dryRun: true,
+      });
+
+      expect(result.totalCost[0].sufficient).toBe(false);
+      expect(result.valid).toBe(false);
     });
   });
 

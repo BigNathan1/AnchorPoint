@@ -43,6 +43,7 @@ const envSchema = z.object({
   INTERACTIVE_URL: z.string().url().default('http://localhost:3000'),
   WEBHOOK_URL: z.string().url().optional(),
   WEBHOOK_SECRET: z.string().min(1, 'WEBHOOK_SECRET cannot be empty').optional(),
+  HORIZON_WEBHOOK_SECRET: z.string().min(1, 'HORIZON_WEBHOOK_SECRET cannot be empty').optional(),
   WEBHOOK_TIMEOUT_MS: z
     .string()
     .default('5000')
@@ -236,6 +237,7 @@ const SENSITIVE_CONFIG_KEYS = [
   'STELLAR_FEE_BUMP_SECRET',
   'RELAYER_SECRET_KEY',
   'WEBHOOK_SECRET',
+  'HORIZON_WEBHOOK_SECRET',
   'SIGNING_KEY',
 ] as const;
 

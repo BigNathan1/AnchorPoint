@@ -72,6 +72,8 @@ impl MultiTokenStaking {
             icon_url: String::from_str(&env, ""),
             website: String::from_str(&env, ""),
         });
+        env.events()
+            .publish((symbol_short!("stk_init"),), (admin, stake_token));
     }
 
     /// Whitelist a new reward token.
@@ -102,7 +104,9 @@ impl MultiTokenStaking {
             env.storage().instance().set(&DataKey::RewardTokens, &reward_tokens);
             env.storage()
                 .instance()
-                .set(&DataKey::RewardPerTokenStored(reward_token), &0_i128);
+                .set(&DataKey::RewardPerTokenStored(reward_token.clone()), &0_i128);
+            env.events()
+                .publish((symbol_short!("rwd_add"),), (admin, reward_token));
         }
     }
 
@@ -314,11 +318,12 @@ impl MultiTokenStaking {
                 &user,
                 &reward,
             );
-
-            env.events()
-                .publish((symbol_short!("claimed"), user, reward_token), reward);
-                .publish((symbol_short!("claimed"), user.clone(), reward_token.clone()), reward);
         }
+
+        env.events()
+            .publish((symbol_short!("claimed"), user.clone(), reward_token.clone()), reward);
+        env.events()
+            .publish((symbol_short!("claimed"),), (user, reward_token, reward));
 
         reward
     }
@@ -353,10 +358,9 @@ impl MultiTokenStaking {
                     &user,
                     &reward,
                 );
-
-                env.events()
-                    .publish((symbol_short!("claimed"), user.clone(), reward_token.clone()), reward);
             }
+            env.events()
+                .publish((symbol_short!("claimed"), user.clone(), reward_token.clone()), reward);
         }
     }
 

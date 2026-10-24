@@ -165,3 +165,24 @@ describe('Admin notification DLQ routes (#1199)', () => {
     expect(res.status).toBe(404);
   });
 });
+
+describe('Admin TOTP MFA routes (#1347)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('returns 401 on /api/admin/mfa/setup when unauthenticated', async () => {
+    const res = await request(app).post('/api/admin/mfa/setup');
+    expect(res.status).toBe(401);
+  });
+
+  it('returns 401 on /api/admin/mfa/confirm when unauthenticated', async () => {
+    const res = await request(app).post('/api/admin/mfa/confirm').send({ code: '123456' });
+    expect(res.status).toBe(401);
+  });
+
+  it('returns 400 on /api/admin/login for invalid payload', async () => {
+    const res = await request(app).post('/api/admin/login').send({ email: 'invalid-email' });
+    expect(res.status).toBe(400);
+  });
+});

@@ -11,10 +11,12 @@ import {
 import prisma from '../../lib/prisma';
 import { isValidStellarPublicKey } from '../../utils/stellar-address';
 import { sep24MetricsMiddleware } from '../middleware/sep24-metrics.middleware';
+import { sepFlowMetricsMiddleware } from '../middleware/sep-flow-metrics.middleware';
 import { Sep24Service, Sep24MemoType } from '../../services/sep24.service';
 import { FeeService } from '../../services/fee.service';
 import { RedisService } from '../../services/redis.service';
 import { redis } from '../../lib/redis';
+import { emitTransactionStatusUpdate } from '../../lib/socket';
 
 const router = Router();
 
@@ -22,6 +24,7 @@ const router = Router();
 export const sep24StatusChannel = (id: string): string => `sep24:tx:${id}`;
 
 router.use(sep24MetricsMiddleware);
+router.use(sepFlowMetricsMiddleware('sep24'));
 
 // ─── Fee service (share mock Redis pattern used in fee.route.ts) ──────────────
 const mockRedisClient = {
@@ -752,9 +755,18 @@ router.patch('/transactions/:id/status', async (req: Request, res: Response) => 
         ...(effectiveClaimableBalanceId ? { claimableBalanceId: effectiveClaimableBalanceId } : {}),
       },
     });
+    if (updatedTransaction?.userId) {
+      emitTransactionStatusUpdate(updatedTransaction.userId, {
+        id: updatedTransaction.id,
+        status: updatedTransaction.status,
+        updated_at: updatedTransaction.updatedAt,
+        stellar_transaction_id: updatedTransaction.stellarTxId,
+      });
+    }
   } catch {
     // Transaction may not exist yet (interactive-only flow); still notify partner.
   }
+
 
   // Fan out to any wallets listening on GET /transaction/sse.
   try {

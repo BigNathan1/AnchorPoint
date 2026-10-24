@@ -146,7 +146,28 @@ export function webhookSignatureMiddleware(options: WebhookSignatureOptions) {
       return;
     }
 
-    if (!timestampHeader) {
+    let resolvedSignature = providedSignature;
+    let resolvedTimestamp = timestampHeader;
+
+    // Support composite header format such as `t=<timestamp>,v1=<hex>` (e.g. X-Stellar-Signature)
+    if (providedSignature.includes(',')) {
+      const parts = providedSignature.split(',').map((p) => p.trim());
+      for (const part of parts) {
+        const eqIdx = part.indexOf('=');
+        if (eqIdx === -1) continue;
+        const k = part.slice(0, eqIdx).trim().toLowerCase();
+        const v = part.slice(eqIdx + 1).trim();
+        if (k === 't' || k === 'ts' || k === 'timestamp') {
+          resolvedTimestamp = v;
+        } else if (k === 'v1' || k === 'sha256' || k === 's' || k === 'sig') {
+          resolvedSignature = v.startsWith('sha256=') ? v : `sha256=${v}`;
+        }
+      }
+    } else if (!resolvedSignature.startsWith('sha256=')) {
+      resolvedSignature = `sha256=${resolvedSignature}`;
+    }
+
+    if (!resolvedTimestamp) {
       logger.warn('Webhook request missing timestamp header', {
         header: tsHeader,
         path: req.path,
@@ -156,7 +177,7 @@ export function webhookSignatureMiddleware(options: WebhookSignatureOptions) {
     }
 
     // Replay-attack guard: reject stale timestamps
-    const requestTs = parseInt(timestampHeader, 10);
+    const requestTs = parseInt(resolvedTimestamp, 10);
     if (isNaN(requestTs)) {
       res.status(401).json({ error: 'invalid_timestamp' });
       return;
@@ -184,8 +205,8 @@ export function webhookSignatureMiddleware(options: WebhookSignatureOptions) {
     const valid = verifyWebhookSignatureMultiSecret(
       rawBody,
       activeSecrets,
-      timestampHeader,
-      providedSignature,
+      resolvedTimestamp,
+      resolvedSignature,
     );
 
     if (!valid) {
@@ -200,5 +221,15 @@ export function webhookSignatureMiddleware(options: WebhookSignatureOptions) {
     next();
   };
 }
+
+export {
+  createHorizonWebhookMiddleware,
+  horizonWebhookMiddleware,
+  verifyHorizonWebhookSignature,
+  computeHorizonSignature,
+  formatStellarSignatureHeader,
+  parseStellarSignatureHeader,
+  HorizonWebhookSignatureOptions,
+} from './horizon-webhook.middleware';
 
 export default webhookSignatureMiddleware;

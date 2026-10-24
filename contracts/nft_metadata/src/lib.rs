@@ -206,6 +206,10 @@ impl NftMetadataContract {
             icon_url: String::from_str(&env, ""),
             website: String::from_str(&env, ""),
         });
+        env.events().publish(
+            (symbol_short!("nft_init"),),
+            (admin, collection.name, collection.symbol),
+        );
     }
 
     // ========================================================================
@@ -826,6 +830,8 @@ impl NftMetadataContract {
         collection.image = image;
 
         env.storage().instance().set(&DataKey::CollectionMetadata, &collection);
+        env.events()
+            .publish((symbol_short!("coll_upd"),), (caller, collection));
     }
 
     // ========================================================================

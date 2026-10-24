@@ -2,6 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { authMiddleware } from "../middleware/auth.middleware";
 import { validate } from "../middleware/validate.middleware";
+import { sepFlowMetricsMiddleware } from "../middleware/sep-flow-metrics.middleware";
 import {
   getInfo,
   createTransaction,
@@ -9,6 +10,8 @@ import {
 } from "../controllers/sep31.controller";
 
 const router = Router();
+
+router.use(sepFlowMetricsMiddleware("sep31"));
 
 // Body schema for POST /sep31/transactions
 const createTransactionBodySchema = z.object({

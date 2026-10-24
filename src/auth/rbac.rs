@@ -244,7 +244,8 @@ impl RBAC {
         env.storage()
             .persistent()
             .set(&used_key, &current_ledger);
-        env.storage().persistent().extend_ttl(
+        anchorpoint_utils::storage::extend_persistent_ttl_with(
+            &env,
             &used_key,
             NONCE_TTL_LEDGERS,
             NONCE_TTL_LEDGERS,
@@ -317,6 +318,8 @@ impl RBACContract {
         env.storage()
             .instance()
             .set(&soroban_sdk::symbol_short!("sec_reg"), &registry);
+        env.events()
+            .publish((symbol_short!("sec_reg"),), registry);
     }
 
     /// Initializes the RBAC contract with an initial administrator.
@@ -410,8 +413,10 @@ impl RBACContract {
 
 #[cfg(test)]
 mod test {
+    extern crate std;
+
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Bytes, Env};
+    use soroban_sdk::{testutils::Address as _, Env};
 
     #[test]
     fn test_rbac_flow() {
@@ -554,23 +559,12 @@ mod test {
         // the attacker tries to reuse nonce 0 after the account nonce was
         // somehow reset (belt-and-suspenders: the used-nonce map must also
         // reject the replay).
-        // We test replay via the sequence-mismatch path first: nonce 0 is
-        // now stale (counter is at 1), so a second call with 0 panics with
-        // sequence mismatch.  To specifically test the used-nonce path we
-        // directly call the library helper.
-        let env2 = Env::default();
-        env2.mock_all_auths();
-        let contract_id2 = env2.register(RBACContract, ());
-        let client2 = RBACContractClient::new(&env2, &contract_id2);
-        let user2 = Address::generate(&env2);
-        // Consume nonce 0 first.
-        client2.consume_nonce(&user2, &0u64);
-        // Manually craft a second consume of nonce 0 to hit the used-nonce
-        // guard.  We poke directly at the RBAC helper to bypass the counter.
-        // Since the StorageVersion counter is already at 1, calling
-        // consume_nonce(0) will hit the sequence-mismatch guard first.
-        // The used-nonce guard is exercised by calling RBAC directly:
-        RBAC::consume_nonce(&env2, &user2, 0); // should panic used-nonce
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .instance()
+                .set(&AccessDataKey::AccountNonce(user.clone()), &0u64);
+            RBAC::consume_nonce(&env, &user, 0);
+        });
     }
 
     #[test]

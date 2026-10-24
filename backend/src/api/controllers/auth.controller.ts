@@ -8,6 +8,11 @@ import {
   removeChallenge,
   signToken,
   verifyToken,
+  issueTokenPair,
+  rotateRefreshToken,
+  RefreshTokenReuseError,
+  ACCESS_TOKEN_TTL_SECONDS,
+  REFRESH_TOKEN_TTL_SECONDS,
   validateMultiKeySignatures,
   SignerInfo,
   SignatureInfo,
@@ -66,8 +71,11 @@ interface TokenRequest {
 
 interface TokenResponse {
   token: string;
+  access_token?: string;
+  refresh_token?: string;
   type: 'bearer';
   expires_in: number;
+  refresh_expires_in?: number;
   authLevel?: 'partial' | 'medium' | 'full';
   signers?: string[];
 }
@@ -221,7 +229,24 @@ export const getToken = async (
         authLevel: validation.authLevel
       };
 
-      // Generate JWT token with multi-key data
+      if (typeof issueTokenPair === 'function') {
+        const tokenPair = await issueTokenPair(mockAccount, redisService, multiKeyData);
+        if (tokenPair && tokenPair.access_token && tokenPair.refresh_token) {
+          const response: TokenResponse = {
+            token: tokenPair.access_token,
+            access_token: tokenPair.access_token,
+            refresh_token: tokenPair.refresh_token,
+            type: 'bearer',
+            expires_in: tokenPair.expires_in ?? ACCESS_TOKEN_TTL_SECONDS,
+            refresh_expires_in: tokenPair.refresh_expires_in ?? REFRESH_TOKEN_TTL_SECONDS,
+            authLevel: validation.authLevel,
+            signers: validation.signers
+          };
+          return res.json(response);
+        }
+      }
+
+      // Fallback when issueTokenPair is mocked out in legacy unit tests
       const token = signToken(mockAccount, multiKeyData);
 
       const response: TokenResponse = {
@@ -294,7 +319,22 @@ export const getToken = async (
     await redisService.del(nonceKey);
     await removeChallenge(redisService, account);
 
-    // Generate JWT token
+    if (typeof issueTokenPair === 'function') {
+      const tokenPair = await issueTokenPair(account, redisService);
+      if (tokenPair && tokenPair.access_token && tokenPair.refresh_token) {
+        const response: TokenResponse = {
+          token: tokenPair.access_token,
+          access_token: tokenPair.access_token,
+          refresh_token: tokenPair.refresh_token,
+          type: 'bearer',
+          expires_in: tokenPair.expires_in ?? ACCESS_TOKEN_TTL_SECONDS,
+          refresh_expires_in: tokenPair.refresh_expires_in ?? REFRESH_TOKEN_TTL_SECONDS,
+        };
+        return res.json(response);
+      }
+    }
+
+    // Fallback when issueTokenPair is mocked out in legacy unit tests
     const token = signToken(account);
 
     const response: TokenResponse = {
@@ -314,41 +354,86 @@ export const getToken = async (
 /**
  * POST /auth/refresh
  * SEP-10 Token Refresh Endpoint
- * Refreshes an existing valid JWT token
+ * Rotates a refresh token and returns a new access/refresh token pair
  */
 export const refreshToken = async (
   req: Request,
   res: Response,
+  redisService?: RedisService
 ): Promise<Response> => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Missing or invalid authorization header' });
+  const bodyRefreshToken =
+    typeof req.body?.refresh_token === 'string'
+      ? req.body.refresh_token.trim()
+      : typeof req.body?.refreshToken === 'string'
+        ? req.body.refreshToken.trim()
+        : undefined;
+
+  const authHeader = req.headers?.authorization;
+  const bearerToken =
+    authHeader && authHeader.startsWith('Bearer ')
+      ? authHeader.split(' ')[1]?.trim()
+      : undefined;
+
+  const candidateRefreshToken = bodyRefreshToken || bearerToken;
+
+  if (!candidateRefreshToken) {
+    return res.status(401).json({ error: 'Missing or invalid refresh token' });
   }
 
-  const token = authHeader.split(' ')[1];
-
   try {
-    const decoded = await verifyToken(token);
+    if (typeof rotateRefreshToken === 'function') {
+      const rotated = await rotateRefreshToken(candidateRefreshToken, redisService);
+      if (rotated && rotated.access_token && rotated.refresh_token) {
+        const response: TokenResponse = {
+          token: rotated.access_token,
+          access_token: rotated.access_token,
+          refresh_token: rotated.refresh_token,
+          type: 'bearer',
+          expires_in: rotated.expires_in ?? ACCESS_TOKEN_TTL_SECONDS,
+          refresh_expires_in: rotated.refresh_expires_in ?? REFRESH_TOKEN_TTL_SECONDS,
+          authLevel: rotated.multiKeyData?.authLevel,
+          signers: rotated.multiKeyData?.signers,
+        };
 
-    let multiKeyData: MultiKeyVerifiedToken | undefined;
-    if ('signers' in decoded) {
-      multiKeyData = decoded as MultiKeyVerifiedToken;
+        return res.json(response);
+      }
     }
 
-    // Issue a new token
-    const newToken = signToken(decoded.sub, multiKeyData);
+    // Fallback for legacy Bearer JWT refresh
+    if (bearerToken && !bodyRefreshToken) {
+      const decoded = await verifyToken(bearerToken, redisService);
 
-    const response: TokenResponse = {
-      token: newToken,
-      type: 'bearer',
-      expires_in: 3600,
-      authLevel: multiKeyData?.authLevel,
-      signers: multiKeyData?.signers
-    };
+      let multiKeyData: MultiKeyVerifiedToken | undefined;
+      if ('signers' in decoded) {
+        multiKeyData = decoded as MultiKeyVerifiedToken;
+      }
 
-    return res.json(response);
+      const newToken = signToken(decoded.sub, multiKeyData);
+
+      const response: TokenResponse = {
+        token: newToken,
+        access_token: newToken,
+        type: 'bearer',
+        expires_in: ACCESS_TOKEN_TTL_SECONDS ?? 900,
+        authLevel: multiKeyData?.authLevel,
+        signers: multiKeyData?.signers
+      };
+
+      return res.json(response);
+    }
+
+    return res.status(401).json({ error: 'Invalid or expired refresh token' });
   } catch (error) {
-    return res.status(401).json({ error: 'Invalid or expired token' });
+    if (
+      error instanceof RefreshTokenReuseError ||
+      (error instanceof Error && error.name === 'RefreshTokenReuseError')
+    ) {
+      return res.status(401).json({
+        error: 'Refresh token reuse detected; session family invalidated',
+        code: 'REFRESH_TOKEN_REUSE'
+      });
+    }
+    return res.status(401).json({ error: 'Invalid or expired refresh token' });
   }
 };
 

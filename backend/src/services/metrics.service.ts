@@ -18,6 +18,9 @@ export class MetricsService {
   private sepTransactionsTotal: Counter<string>;
   private sepTransactionDuration: Histogram<string>;
   private kycVerificationTotal: Counter<string>;
+  private transactionReconciliationTotal: Counter<string>;
+  private sepFlowDuration: Histogram<string>;
+  private batchPaymentOperationsTotal: Counter<string>;
 
   constructor() {
     this.registry = new promClient.Registry();
@@ -159,6 +162,32 @@ export class MetricsService {
       labelNames: ['status', 'provider'] as const,
       registers: [this.registry],
     });
+
+    // #1342: Outcomes of the pending_stellar transaction reconciliation job
+    this.transactionReconciliationTotal = new promClient.Counter({
+      name: 'transaction_reconciliation_total',
+      help: 'Total number of transaction status reconciliations by outcome',
+      labelNames: ['outcome'] as const,
+      registers: [this.registry],
+    });
+
+    // #1330: Per-SEP flow latency for SLA monitoring (SEP-6, SEP-10, SEP-24, SEP-31)
+    this.sepFlowDuration = new promClient.Histogram({
+      name: 'sep_flow_duration_seconds',
+      help: 'Duration of SEP flow requests in seconds by SEP, operation, and status',
+      labelNames: ['sep', 'operation', 'status'] as const,
+      buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+      registers: [this.registry],
+    });
+
+    // #1521: Batch payment counters keyed by batch_id so each batch's metrics
+    // can be inspected independently. Avoids cumulative drift across batches.
+    this.batchPaymentOperationsTotal = new promClient.Counter({
+      name: 'anchor_batch_payment_operations_total',
+      help: 'Total number of payment operations processed per batch, labelled by batch_id, asset_code, and status',
+      labelNames: ['batch_id', 'asset_code', 'status'] as const,
+      registers: [this.registry],
+    });
   }
 
   /**
@@ -180,6 +209,30 @@ export class MetricsService {
    */
   incrementKycVerification(status: string, provider: string = 'internal'): void {
     this.kycVerificationTotal.inc({ status, provider });
+  }
+
+  /**
+   * #1342: Record a transaction reconciliation outcome
+   */
+  incrementTransactionReconciliation(outcome: string): void {
+    this.transactionReconciliationTotal.inc({ outcome });
+  }
+
+  /**
+   * #1330: Observe the duration of a SEP flow request
+   */
+  observeSepFlowDuration(sep: string, operation: string, status: string, durationSeconds: number): void {
+    this.sepFlowDuration.observe({ sep, operation, status }, durationSeconds);
+  }
+
+  /**
+   * #1521: Increment the per-batch payment operations counter.
+   *
+   * Using a batch_id label ensures that counters are scoped to the current
+   * batch and do not accumulate misleadingly across batches.
+   */
+  incrementBatchPaymentOperation(batchId: string, assetCode: string, status: string): void {
+    this.batchPaymentOperationsTotal.inc({ batch_id: batchId, asset_code: assetCode, status });
   }
 
   /**

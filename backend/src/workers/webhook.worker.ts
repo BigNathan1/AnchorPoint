@@ -197,7 +197,6 @@ if (require.main === module) {
   const workerInstance = defaultWebhookWorker.start();
   setupWorkerGracefulShutdown(workerInstance, {
     workerName: 'Webhook worker',
-    timeoutMs: 15000,
     onShutdown: async () => {
       await defaultWebhookWorker.close();
     },

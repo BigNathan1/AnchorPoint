@@ -26,11 +26,13 @@ import { UserAvatarDropdown } from './components/UserAvatarDropdown';
 import { CopyablePublicKey } from './components/CopyablePublicKey';
 import { WalletModal } from './components/WalletModal';
 import { NetworkSelector, NetworkBanner } from './components/NetworkSelector';
+import { NetworkFeeIndicator } from './components/NetworkFeeIndicator';
 import { NetworkProvider } from './contexts/NetworkContext';
 import { SessionTimeoutModal } from './components/Auth/SessionTimeoutModal';
 import { WalletManager } from './lib/wallet';
-import { I18nProvider, useTranslation } from './i18n/config';
+import { I18nProvider, useTranslation, type Language } from './i18n/config';
 import { ThemeProvider, useTheme } from './contexts/ThemeContext';
+import { ToastContainer, useToastQueue } from './components/NotificationCenter';
 
 export { useTheme };
 
@@ -399,6 +401,7 @@ const AppShell = () => {
                 {loadingState === 'error' ? 'Fallback Theme Active' : 'Config Connected'}
               </span>
             </div>
+            <NetworkFeeIndicator apiBaseUrl={apiBaseUrl} />
             <NotificationBell
               apiBaseUrl={apiBaseUrl}
               onViewAll={() => setActiveTab('notifications')}
@@ -434,13 +437,15 @@ const AppShell = () => {
               <select
                 aria-label={t('language.label')}
                 value={language}
-                onChange={(event) => changeLanguage(event.target.value as 'en' | 'es' | 'pt' | 'fr')}
+                onChange={(event) => changeLanguage(event.target.value as Language)}
                 className="rounded-lg border border-slate-700 bg-slate-900 px-2 py-2 text-sm text-slate-200"
               >
                 <option value="en">{t('language.en')}</option>
                 <option value="es">{t('language.es')}</option>
                 <option value="pt">{t('language.pt')}</option>
                 <option value="fr">{t('language.fr')}</option>
+                <option value="ar">{t('language.ar') || 'العربية'}</option>
+                <option value="he">{t('language.he') || 'עברית'}</option>
               </select>
               <NetworkSelector />
               <UserAvatarDropdown
@@ -564,11 +569,32 @@ const ThemeToggle = () => {
   );
 };
 
+/**
+ * Global toast stack rendered at the application root so that any component
+ * in the tree can dispatch toasts without prop-drilling.
+ *
+ * The queue is managed by `useToastQueue` from NotificationCenter. Async
+ * operations throughout the app import `useToastQueue` or consume the context
+ * created here to push feedback to this stack.
+ */
+const ToastStack: React.FC = () => {
+  const { toasts, push: _push, dismiss, pause, resume } = useToastQueue();
+  return (
+    <ToastContainer
+      toasts={toasts}
+      onDismiss={dismiss}
+      onPause={pause}
+      onResume={resume}
+    />
+  );
+};
+
 const AppRoot = () => (
   <ThemeProvider>
     <I18nProvider>
       <NetworkProvider apiBaseUrl={apiBaseUrl}>
         <App />
+        <ToastStack />
       </NetworkProvider>
     </I18nProvider>
   </ThemeProvider>

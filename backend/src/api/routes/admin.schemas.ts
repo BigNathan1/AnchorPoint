@@ -45,3 +45,19 @@ export const purgeCacheSchema = z.object({
     .optional()
     .default('toml'),
 });
+
+export const adminMfaConfirmSchema = z.object({
+  code: z
+    .string()
+    .min(6, 'TOTP code is required')
+    .max(20, 'Invalid code format'),
+});
+
+export const adminLoginSchema = z.object({
+  email: z.string().email('email must be a valid email address'),
+  password: z.string().min(1, 'password is required'),
+  totpCode: z.string().optional(),
+  code: z.string().optional(),
+  token: z.string().optional(),
+  backupCode: z.string().optional(),
+});

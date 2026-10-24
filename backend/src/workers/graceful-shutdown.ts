@@ -1,20 +1,31 @@
+import type { Job } from 'bullmq';
 import logger from '../utils/logger';
+
+const DEFAULT_SHUTDOWN_TIMEOUT_MS = 30000;
+
+function getDefaultTimeoutMs(): number {
+  const parsed = Number(process.env.WORKER_SHUTDOWN_TIMEOUT_MS);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_SHUTDOWN_TIMEOUT_MS;
+}
 
 export interface GracefulShutdownOptions {
   workerName?: string;
-  timeoutMs?: number; // default 15000 (15-second grace window)
+  timeoutMs?: number; // default WORKER_SHUTDOWN_TIMEOUT_MS or 30000
   onShutdown?: () => Promise<void> | void;
   exitProcess?: boolean; // default true (set to false in unit tests)
 }
 
 export interface CloseableWorker {
-  close: () => Promise<unknown>;
+  close: (force?: boolean) => Promise<unknown>;
   disconnect?: () => Promise<unknown>;
+  pause?: (doNotWaitActive?: boolean) => Promise<unknown>;
+  on?(event: any, listener: (...args: any[]) => void): unknown;
 }
 
 /**
  * Registers SIGINT and SIGTERM listeners to gracefully shut down a worker,
- * allowing active BullMQ jobs to finish within a 15-second grace window.
+ * allowing active BullMQ jobs to finish within the grace window. Jobs still
+ * running when the window expires are moved back to the queue.
  */
 export function setupWorkerGracefulShutdown(
   worker: CloseableWorker,
@@ -22,12 +33,34 @@ export function setupWorkerGracefulShutdown(
 ): (signal: string) => Promise<void> {
   const {
     workerName = 'Worker',
-    timeoutMs = 15000,
+    timeoutMs = getDefaultTimeoutMs(),
     onShutdown,
     exitProcess = true,
   } = options;
 
   let isShuttingDown = false;
+
+  // Track in-flight jobs so they can be re-queued if the grace window expires
+  const activeJobs = new Set<Job>();
+  if (typeof worker.on === 'function') {
+    worker.on('active', (job: Job) => activeJobs.add(job));
+    worker.on('completed', (job: Job) => activeJobs.delete(job));
+    worker.on('failed', (job?: Job) => {
+      if (job) activeJobs.delete(job);
+    });
+  }
+
+  const requeueActiveJobs = async () => {
+    for (const job of activeJobs) {
+      try {
+        await job.moveToDelayed(Date.now(), job.token);
+        logger.warn(`Re-queued job ${job.id} that exceeded the shutdown window for ${workerName}`);
+      } catch (requeueErr) {
+        logger.error(`Failed to re-queue job ${job.id} for ${workerName}:`, requeueErr);
+      }
+    }
+    activeJobs.clear();
+  };
 
   const handleShutdown = async (signal: string) => {
     if (isShuttingDown) {
@@ -38,9 +71,15 @@ export function setupWorkerGracefulShutdown(
 
     logger.info(`${signal} received: initiating graceful shutdown for ${workerName} (grace window: ${timeoutMs / 1000}s)`);
 
-    // Setup 15-second grace window timer to prevent hanging
-    const forceExitTimer = setTimeout(() => {
+    // Setup grace window timer to prevent hanging
+    const forceExitTimer = setTimeout(async () => {
       logger.error(`Graceful shutdown timed out after ${timeoutMs}ms for ${workerName}. Forcing exit.`);
+      await requeueActiveJobs();
+      try {
+        await worker.close(true);
+      } catch (closeErr) {
+        logger.warn(`Warning force-closing ${workerName}:`, closeErr);
+      }
       if (exitProcess) {
         process.exit(1);
       }
@@ -51,6 +90,11 @@ export function setupWorkerGracefulShutdown(
     }
 
     try {
+      // 0. Stop accepting new jobs without waiting for the active ones
+      if (typeof worker.pause === 'function') {
+        await worker.pause(true);
+      }
+
       // 1. Close BullMQ worker - waits for active jobs to finish
       logger.info(`Waiting for active jobs to finish and closing ${workerName}...`);
       await worker.close();

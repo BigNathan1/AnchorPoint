@@ -1217,5 +1217,4 @@ export const OracleMonitor: React.FC<OracleMonitorProps> = ({
 };
 
 export { PauseControlsWidget };
-export { OracleMonitor };
 export default AdminWidgets;

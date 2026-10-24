@@ -1,6 +1,7 @@
 import { Worker, Job } from 'bullmq';
 import { QUEUE_NAMES, defaultWorkerOptions, workerConcurrencyConfig } from '../config/queue';
 import logger from '../utils/logger';
+import { setupWorkerGracefulShutdown } from './graceful-shutdown';
 
 export interface EmailJobData {
   to: string;
@@ -46,3 +47,11 @@ export class EmailWorker {
 }
 
 export const defaultEmailWorker = new EmailWorker();
+
+// If executed directly as worker process
+if (require.main === module) {
+  logger.info('Email worker process started');
+  setupWorkerGracefulShutdown(defaultEmailWorker.start(), {
+    workerName: 'Email worker',
+  });
+}
