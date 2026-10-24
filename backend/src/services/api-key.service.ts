@@ -13,9 +13,18 @@ export interface ApiKeyRecord {
   lastUsedAt?: Date | null;
 }
 
+export const API_KEY_FORMAT = /^[a-f0-9]{48}$/;
+
+export function isValidApiKeyFormat(key: string): boolean {
+  return API_KEY_FORMAT.test(key);
+}
+
 export class ApiKeyService {
   async createKey(ownerId: string, tier: Tier, expiresInDays?: number): Promise<ApiKeyRecord> {
     const key = crypto.randomBytes(24).toString("hex"); // 48 hex chars
+    if (!isValidApiKeyFormat(key)) {
+      throw new Error("Internal key generation produced invalid format");
+    }
     const expiresAt = expiresInDays
       ? new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000)
       : null;
