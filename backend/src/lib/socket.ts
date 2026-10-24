@@ -37,6 +37,7 @@ export function initSocket(httpServer: HttpServer): SocketServer {
 
 export function emitTxUpdated(payload: { id: string; status: string; [key: string]: unknown }): void {
   io?.emit('tx_updated', payload);
+  io?.emit('transaction:status_update', payload);
 }
 
 export function getIo(): SocketServer | null {
